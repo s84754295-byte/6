@@ -4,18 +4,17 @@ from emojis import *
 
 def main_menu(user_id: int, is_admin: bool = False):
     b = InlineKeyboardBuilder()
-    b.button(text="MAX", callback_data="submit_app_max", icon_custom_emoji_id=B_SUBMIT)
-    b.button(text="BK", callback_data="submit_app_bk", icon_custom_emoji_id=B_BK)
+    b.button(text="Сдать", callback_data="submit_menu", icon_custom_emoji_id=B_SUBMIT)
     b.button(text="Кабинет", callback_data="profile", icon_custom_emoji_id=B_PROFILE)
-    b.button(text="Вывод средств", callback_data="withdraw", icon_custom_emoji_id=B_WITHDRAW)
-    b.button(text="История заявок", callback_data="my_numbers", icon_custom_emoji_id=B_MY)
-    b.button(text="Очередь номеров", callback_data="public_queue", icon_custom_emoji_id=B_QUEUE)
+    b.button(text="Вывод", callback_data="withdraw", icon_custom_emoji_id=B_WITHDRAW)
+    b.button(text="История", callback_data="my_numbers", icon_custom_emoji_id=B_MY)
+    b.button(text="Очередь", callback_data="public_queue", icon_custom_emoji_id=B_QUEUE)
     b.button(text="Помощь", callback_data="support", icon_custom_emoji_id=B_SUPPORT)
     if is_admin:
-        b.button(text="Админ-панель", callback_data="admin_panel", icon_custom_emoji_id=B_ADMIN)
-        b.adjust(2, 2, 2, 1, 1)
+        b.button(text="Панель", callback_data="admin_panel", icon_custom_emoji_id=B_ADMIN)
+        b.adjust(1, 2, 2, 1, 1)
     else:
-        b.adjust(2, 2, 2, 1)
+        b.adjust(1, 2, 2, 1)
     return b.as_markup()
 
 
@@ -29,8 +28,8 @@ def support_kb():
 
 def submit_category_kb():
     b = InlineKeyboardBuilder()
-    b.button(text="MAX • Незарегистрированный", callback_data="submit_cat_max_unregistered", icon_custom_emoji_id=B_CAT_NEW)
-    b.button(text="MAX • Зарегистрированный", callback_data="submit_cat_max_registered", icon_custom_emoji_id=B_CAT_REG)
+    b.button(text="MAX • Нерег", callback_data="submit_cat_unregistered", icon_custom_emoji_id=B_CAT_NEW)
+    b.button(text="MAX • Рег", callback_data="submit_cat_registered", icon_custom_emoji_id=B_CAT_REG)
     b.button(text="Назад", callback_data="main_menu", icon_custom_emoji_id=B_BACK)
     b.adjust(2, 1)
     return b.as_markup()
@@ -40,7 +39,7 @@ def admin_panel_kb(is_owner: bool = False, bot_enabled: bool = True):
     b = InlineKeyboardBuilder()
     b.button(text="Выплаты", callback_data="wd_panel", icon_custom_emoji_id=B_PAY)
     b.button(text="Цены", callback_data="price_menu", icon_custom_emoji_id=B_MIN)
-    b.button(text="Информация", callback_data="stats", icon_custom_emoji_id=B_STATS)
+    b.button(text="Инфо", callback_data="stats", icon_custom_emoji_id=B_STATS)
     b.button(text="Рассылка", callback_data="broadcast", icon_custom_emoji_id=B_CAST)
     if bot_enabled:
         b.button(text="Стоп", callback_data="bot_stop", icon_custom_emoji_id=B_STOP)
@@ -48,7 +47,7 @@ def admin_panel_kb(is_owner: bool = False, bot_enabled: bool = True):
         b.button(text="Старт", callback_data="bot_start", icon_custom_emoji_id=B_START)
     b.button(text="Очистка", callback_data="clear_queue_menu", icon_custom_emoji_id=B_CLR_REG)
     if is_owner:
-        b.button(text="Администраторы", callback_data="manage_admins", icon_custom_emoji_id=B_ADMINS)
+        b.button(text="Админы", callback_data="manage_admins", icon_custom_emoji_id=B_ADMINS)
         b.button(text="Главная", callback_data="main_menu", icon_custom_emoji_id=B_HOME)
         b.adjust(2, 2, 2, 1, 1)
     else:
@@ -60,23 +59,21 @@ def admin_panel_kb(is_owner: bool = False, bot_enabled: bool = True):
 
 def price_menu_kb():
     b = InlineKeyboardBuilder()
-    b.button(text="MAX • Незарегистрированный", callback_data="set_price_max_unregistered", icon_custom_emoji_id=B_PRICE_NEW)
-    b.button(text="MAX • Зарегистрированный", callback_data="set_price_max_registered", icon_custom_emoji_id=B_PRICE_REG)
-    b.button(text="BK", callback_data="set_price_bk", icon_custom_emoji_id=B_BK)
-    b.button(text="Минимальный вывод", callback_data="set_min_withdraw", icon_custom_emoji_id=B_MIN)
+    b.button(text="MAX • Нерег", callback_data="set_price_unregistered", icon_custom_emoji_id=B_PRICE_NEW)
+    b.button(text="MAX • Рег", callback_data="set_price_registered", icon_custom_emoji_id=B_PRICE_REG)
+    b.button(text="Мин. вывод", callback_data="set_min_withdraw", icon_custom_emoji_id=B_MIN)
     b.button(text="Назад", callback_data="admin_panel", icon_custom_emoji_id=B_BACK)
-    b.adjust(2, 1, 1, 1)
+    b.adjust(2, 1, 1)
     return b.as_markup()
 
 
 def queue_menu_kb():
     b = InlineKeyboardBuilder()
-    b.button(text="MAX • Незарегистрированный", callback_data="queue_max_unregistered", icon_custom_emoji_id=B_CAT_NEW)
-    b.button(text="MAX • Зарегистрированный", callback_data="queue_max_registered", icon_custom_emoji_id=B_CAT_REG)
-    b.button(text="BK", callback_data="queue_bk", icon_custom_emoji_id=B_BK)
+    b.button(text="MAX • Нерег", callback_data="queue_unregistered", icon_custom_emoji_id=B_CAT_NEW)
+    b.button(text="MAX • Рег", callback_data="queue_registered", icon_custom_emoji_id=B_CAT_REG)
     b.button(text="Вся очередь", callback_data="queue_all", icon_custom_emoji_id=B_AQUEUE)
     b.button(text="Назад", callback_data="admin_panel", icon_custom_emoji_id=B_BACK)
-    b.adjust(2, 1, 1, 1)
+    b.adjust(3, 1)
     return b.as_markup()
 
 
@@ -111,16 +108,16 @@ def back_to_admin_kb():
 
 def number_request_kb(number_id: int, user_id: int):
     b = InlineKeyboardBuilder()
-    b.button(text="Запросить код", callback_data=f"reqcode_{number_id}_{user_id}", icon_custom_emoji_id=B_CODE)
-    b.button(text="Отклонить", callback_data=f"cancelnum_{number_id}_{user_id}", icon_custom_emoji_id=B_REJECT)
+    b.button(text="Запр.", callback_data=f"reqcode_{number_id}_{user_id}", icon_custom_emoji_id=B_CODE)
+    b.button(text="Откл.", callback_data=f"cancelnum_{number_id}_{user_id}", icon_custom_emoji_id=B_REJECT)
     b.adjust(2)
     return b.as_markup()
 
 
 def number_confirm_kb(number_id: int, user_id: int):
     b = InlineKeyboardBuilder()
-    b.button(text="Принять", callback_data=f"confirmnum_{number_id}_{user_id}", icon_custom_emoji_id=B_ACCEPT)
-    b.button(text="Отклонить", callback_data=f"rejectnum_{number_id}_{user_id}", icon_custom_emoji_id=B_REJECT)
+    b.button(text="Прин.", callback_data=f"confirmnum_{number_id}_{user_id}", icon_custom_emoji_id=B_ACCEPT)
+    b.button(text="Откл.", callback_data=f"rejectnum_{number_id}_{user_id}", icon_custom_emoji_id=B_REJECT)
     b.adjust(2)
     return b.as_markup()
 
@@ -136,7 +133,7 @@ def withdraw_confirm_user_kb():
 def withdraw_item_kb(withdraw_id: int):
     b = InlineKeyboardBuilder()
     b.button(text="Оплатить", callback_data=f"confirm_withdraw_{withdraw_id}", icon_custom_emoji_id=B_PAY)
-    b.button(text="Отклонить", callback_data=f"reject_withdraw_{withdraw_id}", icon_custom_emoji_id=B_DECLINE)
+    b.button(text="Откл.", callback_data=f"reject_withdraw_{withdraw_id}", icon_custom_emoji_id=B_DECLINE)
     b.adjust(2)
     return b.as_markup()
 
@@ -144,7 +141,7 @@ def withdraw_item_kb(withdraw_id: int):
 def withdraw_action_kb(withdraw_id: int):
     b = InlineKeyboardBuilder()
     b.button(text="Оплатить", callback_data=f"confirm_withdraw_{withdraw_id}", icon_custom_emoji_id=B_PAY)
-    b.button(text="Отклонить", callback_data=f"reject_withdraw_{withdraw_id}", icon_custom_emoji_id=B_DECLINE)
+    b.button(text="Откл.", callback_data=f"reject_withdraw_{withdraw_id}", icon_custom_emoji_id=B_DECLINE)
     b.button(text="В админ-панель", callback_data="admin_panel", icon_custom_emoji_id=B_BACK)
     b.adjust(2, 1)
     return b.as_markup()
@@ -202,7 +199,7 @@ def wd_item_actions_kb(withdraw_id: int, user_id: int):
     b = InlineKeyboardBuilder()
     b.button(text="Оплатить", url=f"tg://user?id={user_id}", icon_custom_emoji_id=B_PAY)
     b.button(text="Оплачено", callback_data=f"wd_mark_paid_{withdraw_id}", icon_custom_emoji_id=B_ACCEPT)
-    b.button(text="Отклонить", callback_data=f"wd_reject_{withdraw_id}", icon_custom_emoji_id=B_REJECT)
+    b.button(text="Откл.", callback_data=f"wd_reject_{withdraw_id}", icon_custom_emoji_id=B_REJECT)
     b.button(text="Назад", callback_data="wd_panel", icon_custom_emoji_id=B_BACK)
     b.adjust(2, 1, 1)
     return b.as_markup()
@@ -210,9 +207,9 @@ def wd_item_actions_kb(withdraw_id: int, user_id: int):
 
 def wd_panel_kb():
     b = InlineKeyboardBuilder()
-    b.button(text="Оплаченные", callback_data="wd_list_paid", icon_custom_emoji_id=B_ACCEPT)
-    b.button(text="Отклонённые", callback_data="wd_list_rejected", icon_custom_emoji_id=B_REJECT)
-    b.button(text="Активные", callback_data="wd_list_pending", icon_custom_emoji_id=B_PAY)
+    b.button(text="Оплач.", callback_data="wd_list_paid", icon_custom_emoji_id=B_ACCEPT)
+    b.button(text="Откл.", callback_data="wd_list_rejected", icon_custom_emoji_id=B_REJECT)
+    b.button(text="Актив.", callback_data="wd_list_pending", icon_custom_emoji_id=B_PAY)
     b.button(text="Назад", callback_data="admin_panel", icon_custom_emoji_id=B_BACK)
     b.adjust(2, 1, 1)
     return b.as_markup()

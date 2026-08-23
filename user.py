@@ -17,9 +17,7 @@ from keyboards import (
 from utils import validate_phone, cb_answer
 from database import (
     get_setting, is_bot_enabled, is_admin, get_admins,
-    ensure_user_record, get_price, count_queue, count_user_active_numbers,
-    CAT_REG, CAT_NEW, CAT_MAX_REG, CAT_MAX_NEW, CAT_BK, CAT_LABEL, APPS,
-    set_subscribed, slots_left, MAX_SLOTS
+    ensure_user_record, get_price, count_queue, count_user_active_numbers, CAT_REG, CAT_NEW, CAT_LABEL, set_subscribed, slots_left, MAX_SLOTS
 )
 from emojis import tg, T_HOME, T_QUEUE, T_QUEUE_ALL, T_QUEUE_OWN, T_PROFILE, T_SUBMIT, T_MY, T_WITHDRAW, T_OK, T_ERR, T_NEW, T_CODE, T_PAY, T_ACCESS, T_STOP, T_CAT, T_WARN, T_SUPPORT, T_LIST, T_HISTORY_ITEM, T_AMOUNT
 
@@ -152,9 +150,8 @@ async def show_menu(target, text: str, reply_markup, parse_mode="HTML", with_pho
 async def build_main_menu_text(user_id: int) -> str:
     bot_on = await is_bot_enabled()
     status = "Включён" if bot_on else "Выключен"
-    price_max_new = await get_price(CAT_MAX_NEW)
-    price_max_reg = await get_price(CAT_MAX_REG)
-    price_bk = await get_price(CAT_BK)
+    price_new = await get_price(CAT_NEW)
+    price_reg = await get_price(CAT_REG)
     queue = await count_queue()
     used, mx = await slots_left(user_id)
     free = max(0, mx - used)
@@ -162,8 +159,7 @@ async def build_main_menu_text(user_id: int) -> str:
         tg(T_HOME, "🏠") + " × <b>Главное меню.</b>\n"
         "━━━━━━━━━━━━━━━━\n"
         f"┌ {tg(T_STOP, '🖥')} <b>Статус работы:</b> {status}\n"
-        f"├ {tg(T_PAY, '🛒')} <b>Прайс MAX:</b> Нерег - (<code>${price_max_new:.2f}</code>) | Рег - (<code>${price_max_reg:.2f}</code>)\n"
-        f"├ {tg(T_LIST, '🧑‍💻')} <b>Прайс BK:</b> <code>${price_bk:.2f}</code>\n"
+        f"├ {tg(T_PAY, '🛒')} <b>Прайс:</b> Нерег - (<code>${price_new:.2f}</code>) | Рег - (<code>${price_reg:.2f}</code>)\n"
         f"├ {tg(T_QUEUE, '🕓')} <b>Очередь номеров:</b> <code>{queue}</code>\n"
         f"└ {tg(T_CAT, '⭐️')} <b>Слотов:</b> <code>{free}/10</code>"
     )
@@ -308,7 +304,7 @@ async def profile_callback(call: CallbackQuery, bot: Bot):
         await show_menu(call, text, back_to_main_kb())
 
 
-@router.callback_query(F.data.in_({"submit_app_max", "submit_app_bk"}))
+@router.callback_query(F.data == "submit_menu")
 async def submit_menu(call: CallbackQuery, state: FSMContext, bot: Bot):
     ok, err = await check_access(call.from_user.id, bot)
     if not ok:
@@ -330,29 +326,15 @@ async def submit_menu(call: CallbackQuery, state: FSMContext, bot: Bot):
         )
         return
     await state.clear()
-    if call.data == "submit_app_bk":
-        # BK — отдельная логика без подкатегорий, номер сразу уходит на сдачу
-        await state.update_data(category=CAT_BK)
-        text = (
-            tg(T_CAT, "⭐️") + " × <b>Сдача номера: BK.</b>\n"
-            "━━━━━━━━━━━━━━━━\n"
-            "<b>Формат:</b> <code>+7XXXXXXXXXX</code>\n"
-            "<b>Пример:</b> <code>+79991234567</code>\n"
-            "<b>Важно:</b> на номер может поступить звонок вместо смс — не отвечайте, "
-            "код придёт отдельным запросом позже."
-        )
-        await show_menu(call, text, cancel_kb("submit_app_bk", with_back=False))
-        await state.set_state(SubmitNumberState.waiting_number)
-        return
     text = (
-        tg(T_SUBMIT, "📥") + " × <b>Сдача номера: MAX.</b>\n"
+        tg(T_SUBMIT, "📥") + " × <b>Сдача номера.</b>\n"
         "━━━━━━━━━━━━━━━━\n"
         "<b>Выберите категорию:</b>"
     )
     await show_menu(call, text, submit_category_kb())
 
 
-@router.callback_query(F.data.in_({"submit_cat_max_registered", "submit_cat_max_unregistered"}))
+@router.callback_query(F.data.in_({"submit_cat_registered", "submit_cat_unregistered"}))
 async def submit_category_chosen(call: CallbackQuery, state: FSMContext, bot: Bot):
     ok, err = await check_access(call.from_user.id, bot)
     if not ok:
@@ -363,11 +345,10 @@ async def submit_category_chosen(call: CallbackQuery, state: FSMContext, bot: Bo
         await cb_answer(call)
         await call.message.answer(off_msg, parse_mode="HTML")
         return
-    category_map = {
-        "submit_cat_max_registered": CAT_MAX_REG,
-        "submit_cat_max_unregistered": CAT_MAX_NEW,
-    }
-    category = category_map[call.data]
+    if call.data == "submit_cat_registered":
+        category = CAT_REG
+    else:
+        category = CAT_NEW
     price = await get_price(category)
     label = CAT_LABEL[category]
     await state.update_data(category=category)
@@ -377,7 +358,7 @@ async def submit_category_chosen(call: CallbackQuery, state: FSMContext, bot: Bo
         "<b>Формат:</b> <code>+7XXXXXXXXXX</code>\n"
         "<b>Пример:</b> <code>+79991234567</code>"
     )
-    await show_menu(call, text, cancel_kb("submit_app_max", with_back=False))
+    await show_menu(call, text, cancel_kb("submit_menu", with_back=False))
     await state.set_state(SubmitNumberState.waiting_number)
 
 
@@ -394,13 +375,10 @@ async def submit_number_process(msg: Message, state: FSMContext, bot: Bot):
         await state.clear()
         return
     number = msg.text.strip()
-    data = await state.get_data()
-    category = data.get("category", CAT_MAX_REG)
-    app = "bk" if category == CAT_BK else "max"
     if not validate_phone(number):
         await msg.answer(
             tg(T_ERR, "🚫") + " × <b>Неверный формат.</b>\n━━━━━━━━━━━━━━━━\n<b>Формат:</b> <code>+7XXXXXXXXXX</code>",
-            reply_markup=cancel_kb(f"submit_app_{app}", with_back=False),
+            reply_markup=cancel_kb("submit_menu", with_back=False),
             parse_mode="HTML"
         )
         return
@@ -415,14 +393,16 @@ async def submit_number_process(msg: Message, state: FSMContext, bot: Bot):
         )
         await state.clear()
         return
+    data = await state.get_data()
+    category = data.get("category", CAT_REG)
     label = CAT_LABEL.get(category, category)
     async with aiosqlite.connect(DB_NAME) as db:
         cur = await db.execute(
-            "SELECT id FROM numbers WHERE number=? AND category=? AND status IN ('pending','code_requested','code_submitted')",
-            (number, category)
+            "SELECT id FROM numbers WHERE number=? AND status IN ('pending','code_requested','code_submitted')",
+            (number,)
         )
         if await cur.fetchone():
-            await msg.answer(tg(T_ERR, "🚫") + " × <b>Ошибка.</b>\n━━━━━━━━━━━━━━━━\nЭтот номер уже в очереди по этой категории.", reply_markup=back_to_main_kb(), parse_mode="HTML")
+            await msg.answer(tg(T_ERR, "🚫") + " × <b>Ошибка.</b>\n━━━━━━━━━━━━━━━━\nЭтот номер уже в очереди.", reply_markup=back_to_main_kb(), parse_mode="HTML")
             await state.clear()
             return
         await db.execute(
@@ -435,15 +415,11 @@ async def submit_number_process(msg: Message, state: FSMContext, bot: Bot):
         number_id = (await cur.fetchone())[0]
     admins = await get_admins()
     uname = fmt_username(msg.from_user.username)
-    if category == CAT_BK:
-        notify_header = tg(T_NEW, "🧪") + f" × <b>Новая заявка ВК №{number_id}.</b>\n"
-    else:
-        notify_header = tg(T_NEW, "🧪") + f" × <b>Новая заявка №{number_id}.</b>\n"
     for admin_id in admins:
         try:
             await bot.send_message(
                 admin_id,
-                notify_header +
+                tg(T_NEW, "🧪") + f" × <b>Новая заявка №{number_id}.</b>\n"
                 "━━━━━━━━━━━━━━━━\n"
                 f"<b>От пользователя:</b> {uname}\n"
                 f"<b>Категория:</b> {label}\n"
@@ -455,22 +431,10 @@ async def submit_number_process(msg: Message, state: FSMContext, bot: Bot):
             pass
     used2, mx2 = await slots_left(msg.from_user.id)
     free2 = max(0, mx2 - used2)
-    if category == CAT_BK:
-        confirm_text = (
-            tg(T_OK, "✅") + " × <b>Номер отправлен.</b>\n"
-            "━━━━━━━━━━━━━━━━\n"
-            "Ожидайте запрос кода от администратора.\n"
-            "На номер может поступить входящий звонок вместо смс — не отвечайте на него, "
-            "код будет запрошен отдельно."
-        )
-    else:
-        confirm_text = (
-            tg(T_OK, "✅") + " × <b>Номер отправлен.</b>\n"
-            "━━━━━━━━━━━━━━━━\n"
-            "Ожидайте запрос кода от администратора."
-        )
     await msg.answer(
-        confirm_text,
+        tg(T_OK, "✅") + " × <b>Номер отправлен.</b>\n"
+        "━━━━━━━━━━━━━━━━\n"
+        "Ожидайте запрос кода от администратора.",
         reply_markup=back_to_main_kb(),
         parse_mode="HTML"
     )
@@ -480,7 +444,6 @@ async def submit_number_process(msg: Message, state: FSMContext, bot: Bot):
 async def _accept_code(msg: Message, bot: Bot, number_id: int, number: str, code: str, state: FSMContext | None = None):
     """Общая логика принятия валидного кода."""
     cat_label = ""
-    category = CAT_REG
     async with aiosqlite.connect(DB_NAME) as db:
         cur = await db.execute("SELECT status, category FROM numbers WHERE id=? AND user_id=?", (number_id, msg.from_user.id))
         row = await cur.fetchone()
@@ -489,29 +452,21 @@ async def _accept_code(msg: Message, bot: Bot, number_id: int, number: str, code
             if state:
                 await state.clear()
             return False
-        category = row[1] or CAT_REG
-        cat_label = CAT_LABEL.get(category, category)
+        cat_label = CAT_LABEL.get(row[1] or CAT_REG, row[1] or "")
         await db.execute("UPDATE numbers SET status='code_submitted', code=? WHERE id=?", (code, number_id))
         await db.commit()
     admins = await get_admins()
     uname = fmt_username(msg.from_user.username)
-    if category == CAT_BK:
-        code_kind = "звонок (последние 4 цифры)" if len(code) == 4 else "смс-код"
-        notify_header = tg(T_CODE, "📨") + f" × <b>Код ВК получен №{number_id}.</b>\n"
-        code_line = f"<b>Код:</b> <code>{code}</code> ({code_kind})\n"
-    else:
-        notify_header = tg(T_CODE, "📨") + f" × <b>Новая заявка №{number_id}.</b>\n"
-        code_line = f"<b>Код:</b> <code>{code}</code>\n"
     for admin_id in admins:
         try:
             await bot.send_message(
                 admin_id,
-                notify_header +
+                tg(T_CODE, "📨") + f" × <b>Новая заявка №{number_id}.</b>\n"
                 "━━━━━━━━━━━━━━━━\n"
                 f"<b>От пользователя:</b> {uname}\n"
                 f"<b>Категория:</b> {cat_label}\n"
                 f"<b>Номер:</b> <code>{number}</code>\n"
-                + code_line,
+                f"<b>Код:</b> <code>{code}</code>",
                 reply_markup=number_confirm_kb(number_id, msg.from_user.id),
                 parse_mode="HTML"
             )
@@ -523,9 +478,8 @@ async def _accept_code(msg: Message, bot: Bot, number_id: int, number: str, code
     return True
 
 
-def _is_valid_code(text: str) -> bool:
-    """Код принимается только если он состоит РОВНО из 4 или 6 цифр (не 5 и не любое другое число)."""
-    return bool(text) and text.isdigit() and len(text) in (4, 6)
+def _is_valid_six_digit_code(text: str) -> bool:
+    return bool(text) and len(text) == 6 and text.isdigit()
 
 
 @router.message(SubmitNumberState.waiting_code, F.text)
@@ -551,10 +505,10 @@ async def submit_code_process(msg: Message, state: FSMContext, bot: Bot):
             parse_mode="HTML",
         )
         return
-    if not _is_valid_code(code):
+    if not _is_valid_six_digit_code(code):
         await msg.answer(
             tg(T_ERR, "🚫") + " × <b>Неверный код.</b>\n━━━━━━━━━━━━━━━━\n"
-            "Код должен состоять из 4 или 6 цифр.",
+            "Код должен состоять ровно из 6 цифр.",
             parse_mode="HTML",
         )
         return
@@ -621,10 +575,10 @@ async def maybe_code_message(msg: Message, state: FSMContext, bot: Bot):
         except Exception:
             pass
 
-    if not _is_valid_code(text):
+    if not _is_valid_six_digit_code(text):
         await msg.answer(
             tg(T_ERR, "🚫") + " × <b>Неверный код.</b>\n━━━━━━━━━━━━━━━━\n"
-            "Код должен состоять из 4 или 6 цифр.",
+            "Код должен состоять ровно из 6 цифр.",
             parse_mode="HTML",
         )
         return
