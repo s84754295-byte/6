@@ -1,4 +1,4 @@
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram import Router, F, Bot
 from aiogram.types import CallbackQuery, Message, FSInputFile, InputMediaPhoto
 from aiogram.fsm.context import FSMContext
@@ -11,7 +11,7 @@ from config import DB_NAME, OWNER_ID
 from utils import cb_answer
 from keyboards import (
     admin_panel_kb, back_to_admin_kb, cancel_kb, back_kb, price_menu_kb,
-    manage_admins_kb, access_panel_kb, number_request_kb, number_confirm_kb,
+    access_panel_kb, number_request_kb, number_confirm_kb,
     withdraw_item_kb, withdraw_action_kb, queue_menu_kb, wd_panel_kb, wd_item_actions_kb,
     clear_queue_confirm_kb, grant_all_confirm_kb, revoke_all_confirm_kb
 )
@@ -23,6 +23,7 @@ from database import (
     get_username,
     CAT_REG, CAT_NEW, CAT_LABEL
 )
+from user import advance_queue
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WELCOME_PHOTO = os.path.join(BASE_DIR, "welcome.jpg")
@@ -34,8 +35,6 @@ class AdminStates(StatesGroup):
     waiting_price_unregistered = State()
     waiting_min_withdraw = State()
     waiting_broadcast = State()
-    waiting_add_admin = State()
-    waiting_remove_admin = State()
     waiting_grant_access = State()
     waiting_revoke_access = State()
 
@@ -126,23 +125,47 @@ async def require_admin(call_or_msg) -> bool:
 async def build_admin_panel_text() -> str:
     bot_on = await is_bot_enabled()
     status = "Включён" if bot_on else "Выключен"
-    q_all = await count_queue()
     async with aiosqlite.connect(DB_NAME) as db:
-        cur = await db.execute("SELECT COUNT(*) FROM withdrawals WHERE status='pending'")
-        pending_wd = (await cur.fetchone())[0]
-        cur = await db.execute("SELECT COUNT(*) FROM users")
-        users_count = (await cur.fetchone())[0]
-        cur = await db.execute("SELECT COUNT(*) FROM users WHERE registered_at >= datetime('now', '-1 day')")
-        new_24h = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(*) FROM numbers WHERE status='accepted'")
+        accepted = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(*) FROM numbers WHERE status IN ('rejected','cancelled')")
+        rejected = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(*) FROM numbers")
+        total_numbers = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COALESCE(SUM(amount),0) FROM withdrawals WHERE status='paid'")
+        paid_sum = (await cur.fetchone())[0]
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM numbers WHERE status='accepted' AND category='registered'"
+        )
+        acc_reg = (await cur.fetchone())[0]
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM numbers WHERE status='accepted' AND (category='unregistered' OR category IS NULL OR category='')"
+        )
+        acc_new = (await cur.fetchone())[0]
+    price_reg = await get_price(CAT_REG)
+    price_new = await get_price(CAT_NEW)
+    earned_est = acc_reg * price_reg + acc_new * price_new
     return (
         tg(T_ADMIN, "🛡") + " × <b>Админ-панель.</b>\n"
         "━━━━━━━━━━━━━━━━\n"
         f"┌ {tg(T_STOP, '🖥')} <b>Статус:</b> {status}\n"
-        f"├ {tg(T_QUEUE, '🕓')} <b>Очередь:</b> <code>{q_all}</code>\n"
-        f"├ {tg(T_PAY, '🛒')} <b>Выводы:</b> <code>{pending_wd}</code>\n"
-        f"├ {tg(T_USERS, '👥')} <b>Пользователей:</b> <code>{users_count}</code>\n"
-        f"└ {tg(T_NEW, '🧪')} <b>Новых за 24ч:</b> <code>{new_24h}</code>"
+        f"├ {tg(T_OK, '✅')} <b>Успешных номеров:</b> <code>{accepted}</code>\n"
+        f"├ {tg(T_ERR, '🚫')} <b>Отклонённых:</b> <code>{rejected}</code>\n"
+        f"├ {tg(T_SUBMIT, '📥')} <b>Всего сдано:</b> <code>{total_numbers}</code>\n"
+        f"├ {tg(T_PAY, '🛒')} <b>Оборот (оценка):</b> <code>${earned_est:.2f}</code>\n"
+        f"└ {tg(T_WITHDRAW, '💼')} <b>Выплачено:</b> <code>${paid_sum:.2f}</code>"
     )
+
+
+@router.message(Command("control"))
+async def control_cmd(msg: Message, state: FSMContext):
+    if not await is_admin(msg.from_user.id):
+        return
+    await state.clear()
+    bot_on = await is_bot_enabled()
+    owner = await is_owner(msg.from_user.id)
+    text = await build_admin_panel_text()
+    await show_menu(msg, text, admin_panel_kb(is_owner=owner, bot_enabled=bot_on))
 
 
 @router.callback_query(F.data == "admin_panel")
@@ -365,6 +388,7 @@ async def cancel_number(call: CallbackQuery, bot: Bot):
             return
         await db.execute("UPDATE users SET failed = failed + 1 WHERE user_id=?", (user_id,))
         await db.commit()
+    await advance_queue(bot)
     try:
         await bot.send_message(
             user_id,
@@ -410,6 +434,7 @@ async def confirm_number(call: CallbackQuery, bot: Bot):
             (price, user_id)
         )
         await db.commit()
+    await advance_queue(bot)
     try:
         await bot.send_message(
             user_id,
@@ -451,6 +476,7 @@ async def reject_number(call: CallbackQuery, bot: Bot):
             return
         await db.execute("UPDATE users SET failed = failed + 1 WHERE user_id=?", (user_id,))
         await db.commit()
+    await advance_queue(bot)
     try:
         await bot.send_message(
             user_id,
@@ -611,12 +637,25 @@ async def show_stats(call: CallbackQuery):
         active_users = (await (await db.execute(
             "SELECT COUNT(*) FROM users WHERE banned=0 AND subscribed=1"
         )).fetchone())[0]
+        banned_users = (await (await db.execute(
+            "SELECT COUNT(*) FROM users WHERE banned=1"
+        )).fetchone())[0]
+        subscribed_users = (await (await db.execute(
+            "SELECT COUNT(*) FROM users WHERE subscribed=1"
+        )).fetchone())[0]
+        approved_users = (await (await db.execute(
+            "SELECT COUNT(*) FROM users WHERE approved=1"
+        )).fetchone())[0]
         new_24h = (await (await db.execute(
             "SELECT COUNT(*) FROM users WHERE registered_at >= datetime('now', '-1 day')"
         )).fetchone())[0]
         new_7d = (await (await db.execute(
             "SELECT COUNT(*) FROM users WHERE registered_at >= datetime('now', '-7 day')"
         )).fetchone())[0]
+        new_30d = (await (await db.execute(
+            "SELECT COUNT(*) FROM users WHERE registered_at >= datetime('now', '-30 day')"
+        )).fetchone())[0]
+
         total_numbers = (await (await db.execute("SELECT COUNT(*) FROM numbers")).fetchone())[0]
         accepted = (await (await db.execute(
             "SELECT COUNT(*) FROM numbers WHERE status='accepted'"
@@ -625,11 +664,30 @@ async def show_stats(call: CallbackQuery):
             "SELECT COUNT(*) FROM numbers WHERE status IN ('rejected','cancelled')"
         )).fetchone())[0]
         in_queue = await count_queue()
+        not_shown = (await (await db.execute(
+            "SELECT COUNT(*) FROM numbers WHERE status='pending' AND notified_admin=0"
+        )).fetchone())[0]
+        waiting_code = (await (await db.execute(
+            "SELECT COUNT(*) FROM numbers WHERE status='code_requested'"
+        )).fetchone())[0]
+        code_sent = (await (await db.execute(
+            "SELECT COUNT(*) FROM numbers WHERE status='code_submitted'"
+        )).fetchone())[0]
+        acc_reg = (await (await db.execute(
+            "SELECT COUNT(*) FROM numbers WHERE status='accepted' AND category='registered'"
+        )).fetchone())[0]
+        acc_new = (await (await db.execute(
+            "SELECT COUNT(*) FROM numbers WHERE status='accepted' AND (category='unregistered' OR category IS NULL OR category='')"
+        )).fetchone())[0]
+
         paid_sum = (await (await db.execute(
             "SELECT COALESCE(SUM(amount),0) FROM withdrawals WHERE status='paid'"
         )).fetchone())[0]
         pending_wd_sum = (await (await db.execute(
             "SELECT COALESCE(SUM(amount),0) FROM withdrawals WHERE status='pending'"
+        )).fetchone())[0]
+        rejected_wd_sum = (await (await db.execute(
+            "SELECT COALESCE(SUM(amount),0) FROM withdrawals WHERE status='rejected'"
         )).fetchone())[0]
         total_balance = (await (await db.execute(
             "SELECT COALESCE(SUM(balance),0) FROM users"
@@ -640,33 +698,58 @@ async def show_stats(call: CallbackQuery):
         paid_wd = (await (await db.execute(
             "SELECT COUNT(*) FROM withdrawals WHERE status='paid'"
         )).fetchone())[0]
-        acc_reg = (await (await db.execute(
-            "SELECT COUNT(*) FROM numbers WHERE status='accepted' AND category='registered'"
+        rejected_wd = (await (await db.execute(
+            "SELECT COUNT(*) FROM withdrawals WHERE status='rejected'"
         )).fetchone())[0]
-        acc_new = (await (await db.execute(
-            "SELECT COUNT(*) FROM numbers WHERE status='accepted' AND (category='unregistered' OR category IS NULL OR category='')"
-        )).fetchone())[0]
+        admins_count = (await (await db.execute("SELECT COUNT(*) FROM admins")).fetchone())[0]
+
     price_reg = await get_price(CAT_REG)
     price_new = await get_price(CAT_NEW)
+    min_withdraw = await get_setting("min_withdraw", "1.0")
     earned_est = acc_reg * price_reg + acc_new * price_new
     bot_on = await is_bot_enabled()
-    # unique emoji per line within this section
+    avg_balance = (total_balance / users_count) if users_count else 0.0
+    conversion = (accepted / total_numbers * 100) if total_numbers else 0.0
+
     text = (
         tg(T_STATS, "📊") + " × <b>Информация.</b>\n"
         "━━━━━━━━━━━━━━━━\n"
-        f"┌ {tg(T_STOP, '🖥')} <b>Сервис:</b> {'Включён' if bot_on else 'Выключен'}\n"
-        f"├ {tg(T_OK, '✅')} <b>Успешных номеров:</b> <code>{accepted}</code>\n"
-        f"├ {tg(T_ERR, '🚫')} <b>Не успешных:</b> <code>{rejected}</code>\n"
-        f"├ {tg(T_QUEUE, '🕓')} <b>В обработке:</b> <code>{in_queue}</code>\n"
-        f"├ {tg(T_SUBMIT, '📥')} <b>Всего сдано:</b> <code>{total_numbers}</code>\n"
-        f"├ {tg(T_PAY, '🛒')} <b>Оборот (оценка):</b> <code>${earned_est:.2f}</code>\n"
-        f"├ {tg(T_WITHDRAW, '💼')} <b>Выплачено:</b> <code>${paid_sum:.2f}</code> (<code>{paid_wd}</code>)\n"
-        f"├ {tg(T_CODE, '📨')} <b>Ожидает выплаты:</b> <code>${pending_wd_sum:.2f}</code> (<code>{pending_wd}</code>)\n"
-        f"├ {tg(T_PROFILE, 'ℹ️')} <b>Балансы пользователей:</b> <code>${total_balance:.2f}</code>\n"
-        f"├ {tg(T_USERS, '👥')} <b>Пользователей всего:</b> <code>{users_count}</code>\n"
-        f"├ {tg(T_ACCESS, '🔓')} <b>Активных:</b> <code>{active_users}</code>\n"
-        f"├ {tg(T_NEW, '🧪')} <b>Новых за 24ч:</b> <code>{new_24h}</code>\n"
-        f"└ {tg(T_CAT, '⭐️')} <b>Новых за 7 дней:</b> <code>{new_7d}</code>"
+        f"{tg(T_USERS, '👥')} <b>Пользователи.</b>\n"
+        f"┌ <b>Всего:</b> <code>{users_count}</code>\n"
+        f"├ <b>Активных:</b> <code>{active_users}</code>\n"
+        f"├ <b>Заблокированных:</b> <code>{banned_users}</code>\n"
+        f"├ <b>Подписанных на канал:</b> <code>{subscribed_users}</code>\n"
+        f"├ <b>Одобренных:</b> <code>{approved_users}</code>\n"
+        f"├ <b>Новых за 24ч:</b> <code>{new_24h}</code>\n"
+        f"├ <b>Новых за 7 дней:</b> <code>{new_7d}</code>\n"
+        f"└ <b>Новых за 30 дней:</b> <code>{new_30d}</code>\n"
+        "\n"
+        f"{tg(T_SUBMIT, '📥')} <b>Заявки на номера.</b>\n"
+        f"┌ <b>Всего сдано:</b> <code>{total_numbers}</code>\n"
+        f"├ <b>Успешных:</b> <code>{accepted}</code>\n"
+        f"├ <b>Отклонённых:</b> <code>{rejected}</code>\n"
+        f"├ <b>В обработке всего:</b> <code>{in_queue}</code>\n"
+        f"├ <b>Ожидают показа админу:</b> <code>{not_shown}</code>\n"
+        f"├ <b>Ждут ввода кода:</b> <code>{waiting_code}</code>\n"
+        f"├ <b>Код отправлен, на проверке:</b> <code>{code_sent}</code>\n"
+        f"├ <b>Принято • Рег:</b> <code>{acc_reg}</code>\n"
+        f"├ <b>Принято • Нерег:</b> <code>{acc_new}</code>\n"
+        f"└ <b>Конверсия в успешные:</b> <code>{conversion:.1f}%</code>\n"
+        "\n"
+        f"{tg(T_WITHDRAW, '💼')} <b>Финансы.</b>\n"
+        f"┌ <b>Оборот (оценка):</b> <code>${earned_est:.2f}</code>\n"
+        f"├ <b>Выплачено:</b> <code>${paid_sum:.2f}</code> (<code>{paid_wd}</code> шт.)\n"
+        f"├ <b>Ожидает выплаты:</b> <code>${pending_wd_sum:.2f}</code> (<code>{pending_wd}</code> шт.)\n"
+        f"├ <b>Отклонено выплат:</b> <code>${rejected_wd_sum:.2f}</code> (<code>{rejected_wd}</code> шт.)\n"
+        f"├ <b>Балансы пользователей:</b> <code>${total_balance:.2f}</code>\n"
+        f"└ <b>Средний баланс:</b> <code>${avg_balance:.2f}</code>\n"
+        "\n"
+        f"{tg(T_STOP, '🖥')} <b>Настройки сервиса.</b>\n"
+        f"┌ <b>Статус:</b> {'Включён' if bot_on else 'Выключен'}\n"
+        f"├ <b>Цена • Рег:</b> <code>${price_reg:.2f}</code>\n"
+        f"├ <b>Цена • Нерег:</b> <code>${price_new:.2f}</code>\n"
+        f"├ <b>Мин. сумма вывода:</b> <code>${float(min_withdraw):.2f}</code>\n"
+        f"└ <b>Админов:</b> <code>{admins_count}</code>"
     )
     await show_menu(call, text, back_to_admin_kb())
 
@@ -1051,20 +1134,82 @@ async def list_with_access(call: CallbackQuery):
     await safe_edit(call, text, access_panel_kb())
 
 
-# ---------- Админы ----------
-@router.callback_query(F.data == "manage_admins")
-async def manage_admins(call: CallbackQuery, state: FSMContext):
-    if not await is_owner(call.from_user.id):
-        await cb_answer(call)
+# ---------- Админы (только команды, только владелец) ----------
+@router.message(Command("add_moder"))
+async def add_moder_cmd(msg: Message, command: CommandObject, state: FSMContext):
+    if not await is_owner(msg.from_user.id):
         return
-    await state.clear()
-    await safe_edit(call, tg(T_ADMIN, "🛡") + " × <b>Администраторы.</b>\n━━━━━━━━━━━━━━━━\nТолько владелец может менять список.", manage_admins_kb())
+    if not command.args or not command.args.strip():
+        await msg.answer(
+            tg(T_OK, "✅") + " × <b>Добавить админа.</b>\n━━━━━━━━━━━━━━━━\n"
+            "<b>Использование:</b> <code>/add_moder ID</code>",
+            parse_mode="HTML"
+        )
+        return
+    try:
+        new_id = int(command.args.strip())
+    except ValueError:
+        await msg.answer(
+            tg(T_ERR, "🚫") + " × <b>Ошибка.</b>\n━━━━━━━━━━━━━━━━\nОтправьте числовой Telegram ID.",
+            parse_mode="HTML"
+        )
+        return
+    if new_id == OWNER_ID:
+        await msg.answer(
+            tg(T_INFO, "🔔") + " × <b>Уже владелец.</b>\n━━━━━━━━━━━━━━━━\nЭто уже владелец.",
+            parse_mode="HTML"
+        )
+        return
+    await add_admin(new_id)
+    await msg.answer(
+        tg(T_OK, "✅") + " × <b>Админ добавлен.</b>\n━━━━━━━━━━━━━━━━\n"
+        f"<b>ID:</b> <code>{new_id}</code>",
+        parse_mode="HTML"
+    )
 
 
-@router.callback_query(F.data == "list_admins")
-async def list_admins(call: CallbackQuery):
-    if not await is_owner(call.from_user.id):
-        await cb_answer(call)
+@router.message(Command("delete_moder"))
+async def delete_moder_cmd(msg: Message, command: CommandObject, state: FSMContext):
+    if not await is_owner(msg.from_user.id):
+        return
+    if not command.args or not command.args.strip():
+        await msg.answer(
+            tg(T_ERR, "🚫") + " × <b>Удалить админа.</b>\n━━━━━━━━━━━━━━━━\n"
+            "<b>Использование:</b> <code>/delete_moder ID</code>",
+            parse_mode="HTML"
+        )
+        return
+    try:
+        admin_id = int(command.args.strip())
+    except ValueError:
+        await msg.answer(
+            tg(T_ERR, "🚫") + " × <b>Ошибка.</b>\n━━━━━━━━━━━━━━━━\nОтправьте числовой Telegram ID.",
+            parse_mode="HTML"
+        )
+        return
+    if admin_id == OWNER_ID:
+        await msg.answer(
+            tg(T_ERR, "🚫") + " × <b>Ошибка.</b>\n━━━━━━━━━━━━━━━━\nВладельца удалить нельзя.",
+            parse_mode="HTML"
+        )
+        return
+    removed = await remove_admin(admin_id)
+    if removed:
+        await msg.answer(
+            tg(T_OK, "✅") + " × <b>Админ удалён.</b>\n━━━━━━━━━━━━━━━━\n"
+            f"<b>ID:</b> <code>{admin_id}</code>",
+            parse_mode="HTML"
+        )
+    else:
+        await msg.answer(
+            tg(T_INFO, "🔔") + " × <b>Не найден.</b>\n━━━━━━━━━━━━━━━━\nЭтот пользователь не админ.",
+            parse_mode="HTML"
+        )
+
+
+@router.message(Command("list_moder"))
+async def list_moder_cmd(msg: Message):
+    if not await is_owner(msg.from_user.id):
         return
     admins = await get_admins()
     text = tg(T_LIST, "🧑‍💻") + " × <b>Список администраторов.</b>\n━━━━━━━━━━━━━━━━\n"
@@ -1072,67 +1217,7 @@ async def list_admins(call: CallbackQuery):
         uname = await get_username(aid)
         uname_s = f"@{uname}" if uname else "@username"
         text += f"{uname_s} | <code>{aid}</code>\n"
-    await safe_edit(call, text, manage_admins_kb())
-
-
-@router.callback_query(F.data == "add_admin")
-async def add_admin_start(call: CallbackQuery, state: FSMContext):
-    if not await is_owner(call.from_user.id):
-        await cb_answer(call)
-        return
-    await safe_edit(call, tg(T_OK, "✅") + " × <b>Добавить админа.</b>\n━━━━━━━━━━━━━━━━\nОтправьте Telegram ID.", reply_markup=cancel_kb("manage_admins"))
-    await state.set_state(AdminStates.waiting_add_admin)
-
-
-@router.message(AdminStates.waiting_add_admin, F.text)
-async def add_admin_process(msg: Message, state: FSMContext):
-    if not await is_owner(msg.from_user.id):
-        return
-    try:
-        new_id = int(msg.text.strip())
-    except ValueError:
-        await msg.answer(tg(T_ERR, "🚫") + " × <b>Ошибка.</b>\n━━━━━━━━━━━━━━━━\nОтправьте числовой Telegram ID.", reply_markup=cancel_kb("manage_admins"), parse_mode="HTML")
-        return
-    if new_id == OWNER_ID:
-        await msg.answer(tg(T_INFO, "🔔") + " × <b>Уже владелец.</b>\n━━━━━━━━━━━━━━━━\nЭто уже владелец.", reply_markup=manage_admins_kb(), parse_mode="HTML")
-        await state.clear()
-        return
-    await add_admin(new_id)
-    await state.clear()
-    try:
-        await msg.delete()
-    except Exception:
-        pass
-
-
-@router.callback_query(F.data == "remove_admin")
-async def remove_admin_start(call: CallbackQuery, state: FSMContext):
-    if not await is_owner(call.from_user.id):
-        await cb_answer(call)
-        return
-    await safe_edit(call, tg(T_ERR, "🚫") + " × <b>Удалить админа.</b>\n━━━━━━━━━━━━━━━━\nОтправьте Telegram ID.", reply_markup=cancel_kb("manage_admins"))
-    await state.set_state(AdminStates.waiting_remove_admin)
-
-
-@router.message(AdminStates.waiting_remove_admin, F.text)
-async def remove_admin_process(msg: Message, state: FSMContext):
-    if not await is_owner(msg.from_user.id):
-        return
-    try:
-        admin_id = int(msg.text.strip())
-    except ValueError:
-        await msg.answer(tg(T_ERR, "🚫") + " × <b>Ошибка.</b>\n━━━━━━━━━━━━━━━━\nОтправьте числовой Telegram ID.", reply_markup=cancel_kb("manage_admins"), parse_mode="HTML")
-        return
-    if admin_id == OWNER_ID:
-        await msg.answer(tg(T_ERR, "🚫") + " × <b>Ошибка.</b>\n━━━━━━━━━━━━━━━━\nВладельца удалить нельзя.", reply_markup=manage_admins_kb(), parse_mode="HTML")
-        await state.clear()
-        return
-    await remove_admin(admin_id)
-    await state.clear()
-    try:
-        await msg.delete()
-    except Exception:
-        pass
+    await msg.answer(text, parse_mode="HTML")
 
 
 # ---------- Выплаты (панель) ----------

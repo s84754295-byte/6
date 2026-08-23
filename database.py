@@ -1,4 +1,5 @@
 import aiosqlite
+from datetime import datetime, timezone, timedelta
 from config import DB_NAME, OWNER_ID, ADMIN_IDS
 
 # category: 'registered' | 'unregistered'
@@ -55,6 +56,19 @@ async def init_db():
                 await db.execute(f"ALTER TABLE numbers ADD COLUMN {col} {typ}")
             except Exception:
                 pass
+        try:
+            await db.execute("ALTER TABLE numbers ADD COLUMN notified_admin INTEGER DEFAULT 0")
+            # существующие "живые" заявки уже были показаны админу по старой логике —
+            # помечаем их как активные, чтобы не сломать уже идущую обработку
+            await db.execute(
+                "UPDATE numbers SET notified_admin=1 WHERE status IN ('pending','code_requested','code_submitted')"
+            )
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE numbers ADD COLUMN price REAL")
+        except Exception:
+            pass
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS settings (
@@ -271,3 +285,81 @@ async def slots_left(user_id: int) -> tuple[int, int]:
     """(занято, максимум)."""
     used = await count_user_active_numbers(user_id)
     return used, MAX_SLOTS
+
+
+async def claim_next_queued_number():
+    """
+    Очередь FIFO: только один номер одновременно "активен" (показан админам).
+    Если сейчас никто не обрабатывается — забирает следующий по очереди номер
+    (самый старый неотправленный админам) и помечает его активным.
+    Возвращает (id, user_id, number, category) или None.
+    """
+    async with aiosqlite.connect(DB_NAME) as db:
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM numbers WHERE notified_admin=1 AND status IN ('pending','code_requested','code_submitted')"
+        )
+        active = (await cur.fetchone())[0]
+        if active > 0:
+            return None
+        cur = await db.execute(
+            "SELECT id, user_id, number, category FROM numbers "
+            "WHERE status='pending' AND notified_admin=0 ORDER BY id ASC LIMIT 1"
+        )
+        row = await cur.fetchone()
+        if not row:
+            return None
+        number_id = row[0]
+        await db.execute("UPDATE numbers SET notified_admin=1 WHERE id=?", (number_id,))
+        await db.commit()
+        return row
+
+
+async def queue_position(number_id: int) -> int:
+    """Позиция заявки в общей очереди обработки (1 = сейчас обрабатывается/следующая)."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM numbers WHERE status IN ('pending','code_requested','code_submitted') AND id<=?",
+            (number_id,),
+        )
+        row = await cur.fetchone()
+        return int(row[0] if row else 1)
+
+
+CODE_TIMEOUT_MINUTES = 2
+
+
+async def expire_code_requests() -> list[tuple[int, int, str]]:
+    """
+    Находит заявки в статусе 'code_requested', у которых истекло время на ввод кода,
+    автоматически отклоняет их (status='rejected') — освобождая слот и номер для
+    повторной сдачи, и возвращает список (number_id, user_id, number) для уведомления.
+    """
+    async with aiosqlite.connect(DB_NAME) as db:
+        cur = await db.execute(
+            "SELECT id, user_id, number, code_requested_at FROM numbers WHERE status='code_requested'"
+        )
+        rows = await cur.fetchall()
+        expired = []
+        now = datetime.now(timezone.utc)
+        for number_id, user_id, number, requested_at in rows:
+            if not requested_at:
+                continue
+            try:
+                requested = datetime.fromisoformat(requested_at)
+                if requested.tzinfo is None:
+                    requested = requested.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            if now - requested > timedelta(minutes=CODE_TIMEOUT_MINUTES):
+                expired.append((number_id, user_id, number))
+        if expired:
+            ids = [e[0] for e in expired]
+            placeholders = ",".join("?" * len(ids))
+            await db.execute(
+                f"UPDATE numbers SET status='rejected' WHERE id IN ({placeholders}) AND status='code_requested'",
+                ids,
+            )
+            for _, user_id, _ in expired:
+                await db.execute("UPDATE users SET failed = failed + 1 WHERE user_id=?", (user_id,))
+            await db.commit()
+        return expired
