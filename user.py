@@ -12,15 +12,15 @@ from config import DB_NAME, OWNER_ID
 from keyboards import (
     main_menu, cancel_kb, back_to_main_kb, submit_category_kb, subscribe_kb, support_kb,
     number_request_kb, number_confirm_kb, withdraw_action_kb,
-    withdraw_confirm_user_kb, back_kb, cancel_numbers_kb, my_numbers_kb
+    withdraw_confirm_user_kb, back_kb, cancel_numbers_kb
 )
 from utils import validate_phone, cb_answer
 from database import (
     get_setting, is_bot_enabled, is_admin, get_admins,
     ensure_user_record, get_price, count_queue, count_user_active_numbers, CAT_REG, CAT_NEW, CAT_LABEL, set_subscribed, slots_left, MAX_SLOTS,
-    claim_next_queued_number, queue_position, get_username
+    queue_position
 )
-from emojis import tg, T_HOME, T_QUEUE, T_QUEUE_ALL, T_QUEUE_OWN, T_PROFILE, T_SUBMIT, T_MY, T_WITHDRAW, T_OK, T_ERR, T_NEW, T_CODE, T_PAY, T_ACCESS, T_STOP, T_CAT, T_WARN, T_SUPPORT, T_LIST, T_HISTORY_ITEM, T_AMOUNT, T_CLEAR, T_INFO
+from emojis import tg, T_HOME, T_QUEUE, T_QUEUE_ALL, T_QUEUE_OWN, T_PROFILE, T_SUBMIT, T_MY, T_WITHDRAW, T_OK, T_ERR, T_NEW, T_CODE, T_PAY, T_ACCESS, T_STOP, T_CAT, T_WARN, T_SUPPORT, T_LIST, T_HISTORY_ITEM, T_AMOUNT, T_CLEAR, T_INFO, T_STATS, T_CHECK
 
 router = Router()
 
@@ -285,24 +285,47 @@ async def profile_callback(call: CallbackQuery, bot: Bot):
         return
     async with aiosqlite.connect(DB_NAME) as db:
         cur = await db.execute(
-            "SELECT balance, total, success, failed FROM users WHERE user_id=?",
+            "SELECT balance, total, success, failed, registered_at FROM users WHERE user_id=?",
             (call.from_user.id,)
         )
         data = await cur.fetchone()
         if not data:
             await show_menu(call, tg(T_ERR, "🚫") + " × <b>Ошибка.</b>\n━━━━━━━━━━━━━━━━\nПользователь не найден.", back_to_main_kb())
             return
-        uname = fmt_username(call.from_user.username)
-        text = (
-            tg(T_PROFILE, "ℹ️") + " × <b>Личный кабинет.</b>\n"
-            "━━━━━━━━━━━━━━━━\n"
-            f"• {tg(T_LIST, '🧑‍💻')} <b>Username:</b> {uname}\n"
-            f"• {tg(T_PAY, '🛒')} <b>Баланс:</b> <code>${data[0]:.2f}</code>\n\n"
-            f"• {tg(T_SUBMIT, '📥')} <b>Сдано:</b> <code>{data[1]}</code>\n"
-            f"• {tg(T_OK, '✅')} <b>Принято:</b> <code>{data[2]}</code>\n"
-            f"• {tg(T_ERR, '🚫')} <b>Отклонено:</b> <code>{data[3]}</code>"
+        balance, total, success, failed, registered_at = data
+        cur = await db.execute(
+            "SELECT COALESCE(SUM(amount),0) FROM numbers WHERE user_id=? AND status='accepted'",
+            (call.from_user.id,)
         )
-        await show_menu(call, text, back_to_main_kb())
+        earned_total = (await cur.fetchone())[0]
+        cur = await db.execute(
+            "SELECT COALESCE(SUM(amount),0) FROM withdrawals WHERE user_id=? AND status='paid'",
+            (call.from_user.id,)
+        )
+        withdrawn_total = (await cur.fetchone())[0]
+    uname = fmt_username(call.from_user.username)
+    used, mx = await slots_left(call.from_user.id)
+    in_progress = used
+    free = max(0, mx - used)
+    success_rate = (success / total * 100) if total else 0.0
+    reg_date = (registered_at or "").split(" ")[0].split("T")[0] if registered_at else "—"
+    text = (
+        tg(T_PROFILE, "ℹ️") + " × <b>Личный кабинет.</b>\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"• {tg(T_LIST, '🧑‍💻')} <b>Username:</b> {uname}\n"
+        f"• {tg(T_CHECK, '🆔')} <b>ID:</b> <code>{call.from_user.id}</code>\n"
+        f"• {tg(T_QUEUE, '📅')} <b>Регистрация:</b> <code>{reg_date}</code>\n\n"
+        f"• {tg(T_PAY, '🛒')} <b>Баланс:</b> <code>${balance:.2f}</code>\n"
+        f"• {tg(T_AMOUNT, '💰')} <b>Заработано всего:</b> <code>${earned_total:.2f}</code>\n"
+        f"• {tg(T_WITHDRAW, '💼')} <b>Выведено всего:</b> <code>${withdrawn_total:.2f}</code>\n\n"
+        f"• {tg(T_SUBMIT, '📥')} <b>Сдано номеров:</b> <code>{total}</code>\n"
+        f"• {tg(T_OK, '✅')} <b>Принято:</b> <code>{success}</code>\n"
+        f"• {tg(T_ERR, '🚫')} <b>Отклонено:</b> <code>{failed}</code>\n"
+        f"• {tg(T_QUEUE, '🕓')} <b>В обработке:</b> <code>{in_progress}</code>\n"
+        f"• {tg(T_STATS, '📊')} <b>Процент успешных:</b> <code>{success_rate:.1f}%</code>\n\n"
+        f"• {tg(T_CAT, '⭐️')} <b>Свободно слотов:</b> <code>{free}/{mx}</code>"
+    )
+    await show_menu(call, text, back_to_main_kb())
 
 
 @router.callback_query(F.data == "submit_menu")
@@ -363,40 +386,6 @@ async def submit_category_chosen(call: CallbackQuery, state: FSMContext, bot: Bo
     await state.set_state(SubmitNumberState.waiting_number)
 
 
-async def notify_admins_of_number(bot: Bot, number_id: int, user_id: int, number: str, category: str):
-    """Отправляет заявку на номер администраторам (следующая в очереди на обработку)."""
-    label = CAT_LABEL.get(category, category)
-    admins = await get_admins()
-    uname = fmt_username(await get_username(user_id))
-    for admin_id in admins:
-        try:
-            await bot.send_message(
-                admin_id,
-                tg(T_NEW, "🧪") + f" × <b>Новая заявка №{number_id}.</b>\n"
-                "━━━━━━━━━━━━━━━━\n"
-                f"<b>От пользователя:</b> {uname}\n"
-                f"<b>Категория:</b> {label}\n"
-                f"<b>Номер:</b> <code>{number}</code>",
-                reply_markup=number_request_kb(number_id, user_id),
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
-
-
-async def advance_queue(bot: Bot):
-    """
-    Очередь FIFO: если сейчас никто не обрабатывается — берёт следующий
-    номер из очереди и отправляет его администраторам. Вызывается после
-    того, как предыдущая заявка закрыта (принята/отклонена/отменена/истекла).
-    """
-    row = await claim_next_queued_number()
-    if not row:
-        return
-    number_id, user_id, number, category = row
-    await notify_admins_of_number(bot, number_id, user_id, number, category)
-
-
 @router.message(SubmitNumberState.waiting_number, F.text)
 async def submit_number_process(msg: Message, state: FSMContext, bot: Bot):
     ok, err = await check_access(msg.from_user.id, bot)
@@ -441,44 +430,46 @@ async def submit_number_process(msg: Message, state: FSMContext, bot: Bot):
         if dup:
             if dup[0] == "accepted":
                 await msg.answer(
-                    tg(T_ERR, "🚫") + " × <b>Номер уже сдан.</b>\n━━━━━━━━━━━━━━━━\n"
-                    f"<b>Номер:</b> <code>{number}</code>\n"
-                    "Этот номер уже был успешно принят администратором ранее.",
+                    tg(T_ERR, "🚫") + " × <b>Номер уже был сдан.</b>\n━━━━━━━━━━━━━━━━\n"
+                    f"<b>Номер:</b> <code>{number}</code>",
                     reply_markup=back_to_main_kb(), parse_mode="HTML"
                 )
             else:
                 await msg.answer(tg(T_ERR, "🚫") + " × <b>Ошибка.</b>\n━━━━━━━━━━━━━━━━\nЭтот номер уже в очереди.", reply_markup=back_to_main_kb(), parse_mode="HTML")
             await state.clear()
             return
-        price_at_submit = await get_price(category)
         await db.execute(
-            "INSERT INTO numbers (user_id, number, status, category, notified_admin, price) VALUES (?, ?, 'pending', ?, 0, ?)",
-            (msg.from_user.id, number, category, price_at_submit)
+            "INSERT INTO numbers (user_id, number, status, category) VALUES (?, ?, 'pending', ?)",
+            (msg.from_user.id, number, category)
         )
         await db.execute("UPDATE users SET total = total + 1 WHERE user_id=?", (msg.from_user.id,))
         await db.commit()
         cur = await db.execute("SELECT last_insert_rowid()")
         number_id = (await cur.fetchone())[0]
-
-    await advance_queue(bot)
+    admins = await get_admins()
+    uname = fmt_username(msg.from_user.username)
+    for admin_id in admins:
+        try:
+            await bot.send_message(
+                admin_id,
+                tg(T_NEW, "🧪") + f" × <b>Новая заявка №{number_id}.</b>\n"
+                "━━━━━━━━━━━━━━━━\n"
+                f"<b>От пользователя:</b> {uname}\n"
+                f"<b>Категория:</b> {label}\n"
+                f"<b>Номер:</b> <code>{number}</code>",
+                reply_markup=number_request_kb(number_id, msg.from_user.id),
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
     position = await queue_position(number_id)
-
-    used2, mx2 = await slots_left(msg.from_user.id)
-    free2 = max(0, mx2 - used2)
-    if position <= 1:
-        text = (
-            tg(T_OK, "✅") + " × <b>Номер отправлен.</b>\n"
-            "━━━━━━━━━━━━━━━━\n"
-            "Ожидайте запрос кода от администратора."
-        )
-    else:
-        text = (
-            tg(T_OK, "✅") + " × <b>Номер отправлен.</b>\n"
-            "━━━━━━━━━━━━━━━━\n"
-            f"<b>Позиция в очереди:</b> <code>{position}</code>\n"
-            "Заявки обрабатываются по очереди, ожидайте своей очереди."
-        )
-    await msg.answer(text, reply_markup=back_to_main_kb(), parse_mode="HTML")
+    await msg.answer(
+        tg(T_OK, "✅") + " × <b>Номер отправлен.</b>\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"<b>Позиция в очереди:</b> <code>{position}</code>",
+        reply_markup=back_to_main_kb(),
+        parse_mode="HTML"
+    )
     await state.clear()
 
 
@@ -607,20 +598,9 @@ async def maybe_code_message(msg: Message, state: FSMContext, bot: Bot):
             if requested.tzinfo is None:
                 requested = requested.replace(tzinfo=timezone.utc)
             if datetime.now(timezone.utc) - requested > timedelta(minutes=2):
-                async with aiosqlite.connect(DB_NAME) as db:
-                    await db.execute(
-                        "UPDATE numbers SET status='rejected' WHERE id=? AND status='code_requested'",
-                        (number_id,),
-                    )
-                    await db.execute("UPDATE users SET failed = failed + 1 WHERE user_id=?", (msg.from_user.id,))
-                    await db.commit()
-                await advance_queue(bot)
                 await msg.answer(
                     tg(T_WARN, "⚠️") + " × <b>Время истекло.</b>\n━━━━━━━━━━━━━━━━\n"
-                    f"<b>Номер:</b> <code>{number}</code>\n"
-                    "Время на ввод кода истекло, заявка отменена.\n"
-                    "Вы можете сдать этот номер повторно.",
-                    reply_markup=back_to_main_kb(),
+                    "Время на ввод кода истекло.",
                     parse_mode="HTML",
                 )
                 return
@@ -638,50 +618,48 @@ async def maybe_code_message(msg: Message, state: FSMContext, bot: Bot):
     await _accept_code(msg, bot, number_id, number, text, state)
 
 
-HISTORY_PAGE_SIZE = 28
-
-
 @router.callback_query(F.data == "my_numbers")
 async def my_numbers(call: CallbackQuery, bot: Bot):
-    await my_numbers_page(call, bot, page=1)
-
-
-@router.callback_query(F.data.regexp(r"^my_numbers_page_\d+$"))
-async def my_numbers_page_callback(call: CallbackQuery, bot: Bot):
-    page = int(call.data.rsplit("_", 1)[1])
-    await my_numbers_page(call, bot, page=page)
-
-
-async def my_numbers_page(call: CallbackQuery, bot: Bot, page: int):
     ok, err = await check_access(call.from_user.id, bot)
     if not ok:
         await cb_answer(call)
         return
     async with aiosqlite.connect(DB_NAME) as db:
-        cur = await db.execute("SELECT COUNT(*) FROM numbers WHERE user_id=?", (call.from_user.id,))
-        total = (await cur.fetchone())[0]
-        if total == 0:
-            await show_menu(
-                call,
-                tg(T_MY, "📚") + " × <b>История номеров.</b>\n━━━━━━━━━━━━━━━━\nПока нет сданных номеров.",
-                back_to_main_kb(),
-            )
-            return
-        total_pages = max(1, (total + HISTORY_PAGE_SIZE - 1) // HISTORY_PAGE_SIZE)
-        page = max(1, min(page, total_pages))
-        offset = (page - 1) * HISTORY_PAGE_SIZE
         cur = await db.execute(
-            "SELECT number, code, price, category FROM numbers WHERE user_id=? ORDER BY id ASC LIMIT ? OFFSET ?",
-            (call.from_user.id, HISTORY_PAGE_SIZE, offset)
+            """
+            SELECT number, code, status, category, seq, amount FROM (
+                SELECT number, code, status, category, id, amount,
+                       ROW_NUMBER() OVER (ORDER BY id ASC) AS seq
+                FROM numbers
+                WHERE user_id=?
+            )
+            ORDER BY id DESC LIMIT 20
+            """,
+            (call.from_user.id,)
         )
         rows = await cur.fetchall()
+    if not rows:
+        await show_menu(
+            call,
+            tg(T_MY, "📚") + " × <b>История номеров.</b>\n━━━━━━━━━━━━━━━━\nПока нет сданных номеров.",
+            back_to_main_kb(),
+        )
+        return
+    status_map = {
+        "accepted": "Принят",
+        "rejected": "Отклонён",
+        "cancelled": "Отклонён",
+        "code_submitted": "На проверке",
+        "code_requested": "Ожидает код",
+        "pending": "В очереди",
+    }
     text = tg(T_MY, "📚") + " × <b>История номеров.</b>\n━━━━━━━━━━━━━━━━\n"
-    for num, code, price, cat in rows:
-        code_s = code if code else "123456"
-        if price is None:
-            price = await get_price(cat or CAT_REG)
-        text += f"<code>{num}</code> — <code>{code_s}</code> — <code>${price:.2f}</code>\n"
-    await show_menu(call, text, my_numbers_kb(page, total_pages))
+    for num, code, status, cat, seq, amount in reversed(rows):
+        st = status_map.get(status, status or "—")
+        code_s = code if code else "—"
+        amt = amount if (status == "accepted" and amount) else 0.0
+        text += f"№{seq} — <code>{num}</code> — <code>{code_s}</code> — {st} — <code>${amt:.2f}</code>\n"
+    await show_menu(call, text, back_to_main_kb())
 
 
 @router.callback_query(F.data == "cancel_menu")
@@ -716,7 +694,7 @@ async def cancel_menu(call: CallbackQuery, bot: Bot):
         return
     text = (
         tg(T_CLEAR, "🗑") + " × <b>Отмена заявки.</b>\n━━━━━━━━━━━━━━━━\n"
-        "Выберите заявку, которую хотите отменить:"
+        "<b>Выберите заявку, которую хотите отменить:</b>"
     )
     await show_menu(call, text, cancel_numbers_kb(rows))
 
@@ -730,7 +708,7 @@ async def user_cancel_number(call: CallbackQuery, bot: Bot):
     number_id = int(call.data.split("_")[2])
     async with aiosqlite.connect(DB_NAME) as db:
         cur = await db.execute(
-            "SELECT number, status, notified_admin FROM numbers WHERE id=? AND user_id=?",
+            "SELECT number, status FROM numbers WHERE id=? AND user_id=?",
             (number_id, call.from_user.id),
         )
         row = await cur.fetchone()
@@ -742,7 +720,7 @@ async def user_cancel_number(call: CallbackQuery, bot: Bot):
                 parse_mode="HTML",
             )
             return
-        number, _, notified_admin = row
+        number = row[0]
         cur = await db.execute(
             "UPDATE numbers SET status='cancelled' WHERE id=? AND status='pending'",
             (number_id,),
@@ -752,20 +730,6 @@ async def user_cancel_number(call: CallbackQuery, bot: Bot):
             return
         await db.execute("UPDATE users SET failed = failed + 1 WHERE user_id=?", (call.from_user.id,))
         await db.commit()
-    if notified_admin:
-        await advance_queue(bot)
-        admins = await get_admins()
-        for admin_id in admins:
-            try:
-                await bot.send_message(
-                    admin_id,
-                    tg(T_INFO, "🔔") + f" × <b>Заявка №{number_id} отменена пользователем.</b>\n"
-                    "━━━━━━━━━━━━━━━━\n"
-                    f"<b>Номер:</b> <code>{number}</code>",
-                    parse_mode="HTML",
-                )
-            except Exception:
-                pass
     await cb_answer(call)
     text = (
         tg(T_OK, "✅") + " × <b>Заявка отменена.</b>\n━━━━━━━━━━━━━━━━\n"
