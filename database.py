@@ -86,6 +86,15 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        for col, coldef in [
+            ("spend_id", "TEXT"),
+            ("asset", "TEXT DEFAULT 'USDT'"),
+            ("error", "TEXT"),
+        ]:
+            try:
+                await db.execute(f"ALTER TABLE withdrawals ADD COLUMN {col} {coldef}")
+            except Exception:
+                pass
         await db.execute("""
             CREATE TABLE IF NOT EXISTS admins (
                 user_id INTEGER PRIMARY KEY
@@ -363,3 +372,77 @@ async def expire_code_requests() -> list[tuple[int, int, str]]:
                 await db.execute("UPDATE users SET failed = failed + 1 WHERE user_id=?", (user_id,))
             await db.commit()
         return expired
+
+
+# ---------- Казна: атомарные операции с виртуальным балансом и историей выводов ----------
+
+async def try_deduct_balance(user_id: int, amount: float) -> bool:
+    """
+    Атомарно списывает виртуальный баланс, только если денег хватает.
+    Вызывается ДО отправки реального перевода через CryptoPay, чтобы пользователь
+    не смог вывести больше, чем у него есть, даже при параллельных запросах.
+    """
+    async with aiosqlite.connect(DB_NAME) as db:
+        cur = await db.execute(
+            "UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?",
+            (amount, user_id, amount),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def refund_balance(user_id: int, amount: float) -> None:
+    """Возвращает деньги на виртуальный баланс, если реальный перевод не удался."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user_id))
+        await db.commit()
+
+
+async def create_withdrawal(user_id: int, amount: float, asset: str, spend_id: str) -> int:
+    """Создаёт запись о выводе со статусом 'processing' ДО вызова transfer() — идемпотентность."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        cur = await db.execute(
+            "INSERT INTO withdrawals (user_id, amount, status, asset, spend_id) VALUES (?, ?, 'processing', ?, ?)",
+            (user_id, amount, asset, spend_id),
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def mark_withdrawal(withdrawal_id: int, status: str, error: str | None = None) -> None:
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "UPDATE withdrawals SET status=?, error=? WHERE id=?",
+            (status, error, withdrawal_id),
+        )
+        await db.commit()
+
+
+async def get_treasury_stats() -> dict:
+    """Статистика по выводам для админского экрана 'Казна' (сверка с реальным балансом приложения)."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        cur = await db.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM withdrawals WHERE status='success'")
+        n_success, sum_success = await cur.fetchone()
+        cur = await db.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM withdrawals WHERE status='failed'")
+        n_failed, sum_failed = await cur.fetchone()
+        cur = await db.execute("SELECT COUNT(*) FROM withdrawals WHERE status='processing'")
+        n_processing = (await cur.fetchone())[0]
+        cur = await db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(amount),0) FROM withdrawals "
+            "WHERE status='success' AND created_at >= datetime('now','-1 day')"
+        )
+        n_24h, sum_24h = await cur.fetchone()
+        cur = await db.execute("SELECT COALESCE(SUM(balance),0) FROM users")
+        total_balance = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(DISTINCT user_id) FROM withdrawals WHERE status='success'")
+        n_users = (await cur.fetchone())[0]
+    avg = (sum_success / n_success) if n_success else 0.0
+    return {
+        "n_success": n_success, "sum_success": sum_success,
+        "n_failed": n_failed, "sum_failed": sum_failed,
+        "n_processing": n_processing,
+        "n_24h": n_24h, "sum_24h": sum_24h,
+        "total_balance": total_balance,
+        "n_users": n_users,
+        "avg": avg,
+    }

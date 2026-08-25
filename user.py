@@ -6,9 +6,10 @@ from aiogram.fsm.state import State, StatesGroup
 import aiosqlite
 import os
 import re
+import uuid
 from datetime import datetime, timezone, timedelta
 
-from config import DB_NAME, OWNER_ID
+from config import DB_NAME, OWNER_ID, DEFAULT_ASSET
 from keyboards import (
     main_menu, cancel_kb, back_to_main_kb, submit_category_kb, subscribe_kb, support_kb,
     number_request_kb, number_confirm_kb,
@@ -18,9 +19,12 @@ from utils import validate_phone, cb_answer
 from database import (
     get_setting, is_bot_enabled, is_admin, get_admins,
     ensure_user_record, get_price, count_queue, count_user_active_numbers, CAT_REG, CAT_NEW, CAT_LABEL, set_subscribed, slots_left, MAX_SLOTS,
-    claim_next_queued_number, queue_position, get_username
+    claim_next_queued_number, queue_position, get_username,
+    try_deduct_balance, refund_balance, create_withdrawal, mark_withdrawal
 )
+from cryptopay import cp, CryptoPayError
 from emojis import tg, T_HOME, T_QUEUE, T_QUEUE_ALL, T_QUEUE_OWN, T_PROFILE, T_SUBMIT, T_MY, T_WITHDRAW, T_OK, T_ERR, T_NEW, T_CODE, T_PAY, T_ACCESS, T_STOP, T_CAT, T_WARN, T_SUPPORT, T_LIST, T_HISTORY_ITEM, T_AMOUNT, T_CLEAR, T_INFO
+
 
 router = Router()
 
@@ -819,8 +823,9 @@ async def withdraw_start(call: CallbackQuery, state: FSMContext, bot: Bot):
             await show_menu(call, text, back_to_main_kb())
             return
         text = (
-            tg(T_WITHDRAW, "💼") + " × <b>Заявка на вывод.</b>\n"
+            tg(T_WITHDRAW, "💼") + " × <b>Вывод средств.</b>\n"
             "━━━━━━━━━━━━━━━━\n"
+            "Деньги придут мгновенно на ваш кошелёк в @CryptoBot.\n"
             f"{tg(T_AMOUNT, '👝')} <b>Введите сумму вывода:</b>"
         )
         await show_menu(call, text, cancel_kb())
@@ -887,49 +892,105 @@ async def withdraw_user_confirm(call: CallbackQuery, state: FSMContext, bot: Bot
         await state.clear()
         return
     amount = float(amount)
-    async with aiosqlite.connect(DB_NAME) as db:
-        cur = await db.execute("SELECT balance FROM users WHERE user_id=?", (call.from_user.id,))
-        row = await cur.fetchone()
+    user_id = call.from_user.id
+
+    # 1. Атомарно списываем виртуальный баланс ДО реального перевода —
+    #    чтобы пользователь не смог вывести больше, чем у него есть.
+    ok_ded = await try_deduct_balance(user_id, amount)
+    if not ok_ded:
+        async with aiosqlite.connect(DB_NAME) as db:
+            cur = await db.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+            row = await cur.fetchone()
         balance = row[0] if row else 0
-        if amount > balance:
-            await call.message.edit_text(
-                tg(T_ERR, "🚫") + " × <b>Недостаточно средств.</b>\n━━━━━━━━━━━━━━━━\n"
-                f"{tg(T_PAY, '🛒')} <b>Баланс:</b> <code>${balance:.2f}</code>",
-                reply_markup=back_to_main_kb(), parse_mode="HTML"
-            )
-            await state.clear()
-            await call.answer()
-            return
-        await db.execute(
-            "INSERT INTO withdrawals (user_id, amount, crypto_address, status) VALUES (?, ?, ?, 'pending')",
-            (call.from_user.id, amount, "")
+        await call.message.edit_text(
+            tg(T_ERR, "🚫") + " × <b>Недостаточно средств.</b>\n━━━━━━━━━━━━━━━━\n"
+            f"{tg(T_PAY, '🛒')} <b>Баланс:</b> <code>${balance:.2f}</code>",
+            reply_markup=back_to_main_kb(), parse_mode="HTML"
         )
-        await db.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (amount, call.from_user.id))
-        await db.commit()
-        cur = await db.execute("SELECT last_insert_rowid()")
-        withdraw_id = (await cur.fetchone())[0]
-    admins = await get_admins()
-    uname = fmt_username(call.from_user.username)
-    for admin_id in admins:
-        try:
-            await bot.send_message(
-                admin_id,
-                tg(T_WITHDRAW, "💼") + " × <b>Новая заявка на вывод.</b>\n"
-                "━━━━━━━━━━━━━━━━\n"
-                f"<b>От пользователя:</b> {uname}\n"
-                f"<b>Сумма:</b> <code>${amount:.2f}</code>",
-                parse_mode="HTML"
+        await state.clear()
+        await call.answer()
+        return
+
+    # 2. Идемпотентный ключ генерируется и сохраняется ДО вызова transfer,
+    #    чтобы при обрыве соединения повторный вызов не отправил деньги дважды.
+    spend_id = uuid.uuid4().hex
+    withdrawal_id = await create_withdrawal(user_id, amount, DEFAULT_ASSET, spend_id)
+
+    processing_text = (
+        tg(T_WITHDRAW, "💼") + " × <b>Обрабатываем вывод.</b>\n━━━━━━━━━━━━━━━━\n"
+        f"<b>Сумма:</b> <code>${amount:.2f}</code>\n"
+        "Отправляем на ваш кошелёк в @CryptoBot..."
+    )
+    try:
+        await call.message.edit_text(processing_text, parse_mode="HTML")
+    except Exception:
+        pass
+
+    # 3. Реальная мгновенная отправка денег из казны на кошелёк пользователя в @CryptoBot.
+    try:
+        await cp.transfer(
+            user_id=user_id,
+            asset=DEFAULT_ASSET,
+            amount=amount,
+            spend_id=spend_id,
+            comment="Вывод средств",
+        )
+    except CryptoPayError as e:
+        await refund_balance(user_id, amount)
+        await mark_withdrawal(withdrawal_id, "failed", str(e.message))
+        if e.code == 400 and isinstance(e.message, str) and "USER_NOT_FOUND" in e.message.upper():
+            fail_text = (
+                tg(T_ERR, "🚫") + " × <b>Не удалось выполнить вывод.</b>\n━━━━━━━━━━━━━━━━\n"
+                "Похоже, вы ни разу не открывали @CryptoBot.\n"
+                "Откройте его, нажмите /start, затем повторите вывод.\n"
+                f"<code>${amount:.2f}</code> возвращено на баланс."
             )
+        else:
+            fail_text = (
+                tg(T_ERR, "🚫") + " × <b>Не удалось выполнить вывод.</b>\n━━━━━━━━━━━━━━━━\n"
+                f"<code>${amount:.2f}</code> возвращено на баланс."
+            )
+        try:
+            await call.message.edit_text(fail_text, reply_markup=back_to_main_kb(), parse_mode="HTML")
         except Exception:
-            pass
+            await call.message.answer(fail_text, reply_markup=back_to_main_kb(), parse_mode="HTML")
+        for admin_id in await get_admins():
+            try:
+                await bot.send_message(
+                    admin_id,
+                    tg(T_ERR, "🚫") + " × <b>Вывод не выполнен.</b>\n━━━━━━━━━━━━━━━━\n"
+                    f"<b>От пользователя:</b> {fmt_username(call.from_user.username)}\n"
+                    f"<b>Сумма:</b> <code>${amount:.2f}</code>\n"
+                    f"<b>Ошибка:</b> <code>{e.message}</code>",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+        await state.clear()
+        await cb_answer(call)
+        return
+
+    await mark_withdrawal(withdrawal_id, "success")
     ok_text = (
-        tg(T_OK, "✅") + " × <b>Заявка создана.</b>\n━━━━━━━━━━━━━━━━\n"
-        f"<b>Сумма:</b> <code>${amount:.2f}</code>"
+        tg(T_OK, "✅") + " × <b>Готово.</b>\n━━━━━━━━━━━━━━━━\n"
+        f"<b>Сумма:</b> <code>${amount:.2f}</code>\n"
+        "Отправлено на ваш кошелёк в @CryptoBot."
     )
     try:
         await call.message.edit_text(ok_text, reply_markup=back_to_main_kb(), parse_mode="HTML")
     except Exception:
         await call.message.answer(ok_text, reply_markup=back_to_main_kb(), parse_mode="HTML")
+    for admin_id in await get_admins():
+        try:
+            await bot.send_message(
+                admin_id,
+                tg(T_WITHDRAW, "💼") + " × <b>Автовыплата выполнена.</b>\n━━━━━━━━━━━━━━━━\n"
+                f"<b>От пользователя:</b> {fmt_username(call.from_user.username)}\n"
+                f"<b>Сумма:</b> <code>${amount:.2f}</code>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
     await state.clear()
     await cb_answer(call)
 

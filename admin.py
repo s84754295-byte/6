@@ -12,7 +12,7 @@ from utils import cb_answer
 from keyboards import (
     admin_panel_kb, back_to_admin_kb, cancel_kb, back_kb, price_menu_kb,
     access_panel_kb, number_request_kb, number_confirm_kb,
-    queue_menu_kb, wd_panel_kb, wd_item_actions_kb,
+    queue_menu_kb,
     clear_queue_confirm_kb, grant_all_confirm_kb, revoke_all_confirm_kb
 )
 from emojis import tg, T_HOME, T_ADMIN, T_QUEUE, T_OK, T_ERR, T_NEW, T_CODE, T_PAY, T_ACCESS, T_STATS, T_LIST, T_BROADCAST, T_PRICE, T_STOP, T_CLEAR, T_WARN, T_USERS, T_PROFILE, T_INFO, T_CHECK, T_SUBMIT, T_WITHDRAW, T_CAT
@@ -20,9 +20,11 @@ from database import (
     get_setting, set_setting, is_admin, is_owner,
     get_admins, add_admin, remove_admin, is_bot_enabled,
     set_approved, ensure_user_record, get_price, clear_queue, count_queue,
-    get_username,
+    get_username, get_treasury_stats,
     CAT_REG, CAT_NEW, CAT_LABEL
 )
+from cryptopay import cp, CryptoPayError
+from config import DEFAULT_ASSET
 from user import advance_queue
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1150,177 +1152,39 @@ async def list_moder_cmd(msg: Message):
     await msg.answer(text, parse_mode="HTML")
 
 
-# ---------- Выплаты (панель) ----------
-@router.callback_query(F.data == "wd_panel")
-async def wd_panel(call: CallbackQuery):
+# ---------- Казна ----------
+@router.callback_query(F.data == "treasury")
+async def treasury(call: CallbackQuery):
     if not await require_admin(call):
         return
-    async with aiosqlite.connect(DB_NAME) as db:
-        cur = await db.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM withdrawals WHERE status='pending'")
-        n_pending, sum_pending = await cur.fetchone()
-        cur = await db.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM withdrawals WHERE status='paid'")
-        n_paid, sum_paid = await cur.fetchone()
-        cur = await db.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM withdrawals WHERE status='rejected'")
-        n_rej, sum_rej = await cur.fetchone()
-        cur = await db.execute("SELECT COUNT(*) FROM withdrawals")
-        n_total = (await cur.fetchone())[0]
-        cur = await db.execute("SELECT COUNT(DISTINCT user_id) FROM withdrawals")
-        n_users = (await cur.fetchone())[0]
-        cur = await db.execute(
-            "SELECT COUNT(*), COALESCE(SUM(amount),0) FROM withdrawals "
-            "WHERE status='paid' AND created_at >= datetime('now','-1 day')"
-        )
-        n_paid_24h, sum_paid_24h = await cur.fetchone()
-        cur = await db.execute("SELECT COALESCE(MAX(amount),0) FROM withdrawals WHERE status='pending'")
-        max_pending = (await cur.fetchone())[0]
-        cur = await db.execute("SELECT COALESCE(SUM(balance),0) FROM users")
-        total_balance = (await cur.fetchone())[0]
-    avg_paid = (sum_paid / n_paid) if n_paid else 0.0
-    text = (
-        tg(T_PAY, "🛒") + " × <b>Выплаты.</b>\n"
-        "━━━━━━━━━━━━━━━━\n"
-        f"┌ <b>Активных:</b> <code>{n_pending}</code> на сумму <code>${sum_pending:.2f}</code>\n"
-        f"├ <b>Оплаченных:</b> <code>{n_paid}</code> на сумму <code>${sum_paid:.2f}</code>\n"
-        f"├ <b>Отклонённых:</b> <code>{n_rej}</code> на сумму <code>${sum_rej:.2f}</code>\n"
-        f"├ <b>Всего заявок:</b> <code>{n_total}</code>\n"
-        f"├ <b>Уникальных пользователей:</b> <code>{n_users}</code>\n"
-        f"├ <b>Оплачено за 24ч:</b> <code>{n_paid_24h}</code> на сумму <code>${sum_paid_24h:.2f}</code>\n"
-        f"├ <b>Средняя выплата:</b> <code>${avg_paid:.2f}</code>\n"
-        f"├ <b>Крупнейшая активная заявка:</b> <code>${max_pending:.2f}</code>\n"
-        f"└ <b>Общий баланс пользователей:</b> <code>${total_balance:.2f}</code>"
-    )
-    await show_menu(call, text, wd_panel_kb())
-
-
-@router.callback_query(F.data.in_({"wd_list_pending", "wd_list_paid", "wd_list_rejected"}))
-async def wd_list(call: CallbackQuery):
-    if not await require_admin(call):
-        return
-    status_map = {
-        "wd_list_pending": ("pending", "Активные заявки"),
-        "wd_list_paid": ("paid", "Оплаченные"),
-        "wd_list_rejected": ("rejected", "Отклонённые"),
-    }
-    st, title = status_map[call.data]
-    async with aiosqlite.connect(DB_NAME) as db:
-        cur = await db.execute(
-            """
-            SELECT w.id, w.user_id, w.amount, u.username
-            FROM withdrawals w LEFT JOIN users u ON u.user_id = w.user_id
-            WHERE w.status=? ORDER BY w.id DESC LIMIT 20
-            """,
-            (st,),
-        )
-        rows = await cur.fetchall()
-        cur = await db.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM withdrawals WHERE status=?", (st,))
-        total_count, total_sum = await cur.fetchone()
-    if not rows:
-        await show_menu(call, tg(T_PAY, "🛒") + f" × <b>{title}.</b>\n━━━━━━━━━━━━━━━━\nЗаявок нет.", wd_panel_kb())
-        return
-    from aiogram.utils.keyboard import InlineKeyboardBuilder
-    b = InlineKeyboardBuilder()
-    text = (
-        tg(T_PAY, "🛒") + f" × <b>{title}.</b>\n━━━━━━━━━━━━━━━━\n"
-        f"<b>Всего:</b> <code>{total_count}</code> на сумму <code>${total_sum:.2f}</code>\n"
-        f"<b>Показано:</b> <code>{len(rows)}</code>\n\n"
-    )
-    for wid, uid, amount, uname in rows:
-        uname_s = f"@{uname}" if uname else "@username"
-        text += f"{uname_s} | <code>{uid}</code> — <code>${amount:.2f}</code>\n"
-        if st == "pending":
-            b.button(text=f"Открыть заявку #{wid} — ${amount:.2f}", callback_data=f"wd_open_{wid}")
-    b.button(text="Назад", callback_data="wd_panel")
-    b.adjust(1)
-    await show_menu(call, text, b.as_markup())
-
-
-@router.callback_query(F.data.regexp(r"^wd_open_\d+$"))
-async def wd_open(call: CallbackQuery):
-    if not await require_admin(call):
-        return
-    wid = int(call.data.split("_")[-1])
-    async with aiosqlite.connect(DB_NAME) as db:
-        cur = await db.execute(
-            """
-            SELECT w.user_id, w.amount, w.status, u.username
-            FROM withdrawals w LEFT JOIN users u ON u.user_id = w.user_id
-            WHERE w.id=?
-            """,
-            (wid,),
-        )
-        row = await cur.fetchone()
-    if not row or row[2] != "pending":
-        await cb_answer(call)
-        return
-    uid, amount, status, uname = row
-    uname_s = f"@{uname}" if uname else "@username"
-    text = (
-        tg(T_PAY, "🛒") + f" × <b>Заявка #{wid}.</b>\n"
-        "━━━━━━━━━━━━━━━━\n"
-        f"<b>От:</b> {uname_s}\n"
-        f"<b>ID:</b> <code>{uid}</code>\n"
-        f"<b>Сумма:</b> <code>${amount:.2f}</code>"
-    )
-    await show_menu(call, text, wd_item_actions_kb(wid, uid))
-
-
-@router.callback_query(F.data.regexp(r"^wd_mark_paid_\d+$"))
-async def wd_mark_paid(call: CallbackQuery, bot: Bot):
-    if not await require_admin(call):
-        return
-    wid = int(call.data.split("_")[-1])
-    async with aiosqlite.connect(DB_NAME) as db:
-        cur = await db.execute("SELECT user_id, amount, status FROM withdrawals WHERE id=?", (wid,))
-        row = await cur.fetchone()
-        if not row or row[2] != "pending":
-            await cb_answer(call)
-            return
-        uid, amount, _ = row
-        await db.execute("UPDATE withdrawals SET status='paid' WHERE id=? AND status='pending'", (wid,))
-        await db.commit()
+    stats = await get_treasury_stats()
+    real_balance_lines = []
     try:
-        await bot.send_message(
-            uid,
-            tg(T_OK, "✅") + " × <b>Вывод оплачен.</b>\n━━━━━━━━━━━━━━━━\n"
-            f"<b>Сумма:</b> <code>${amount:.2f}</code>",
-            parse_mode="HTML",
-        )
+        balances = await cp.get_balance()
+        for b in balances:
+            avail = b.get("available", b.get("amount", "0"))
+            if float(avail or 0) > 0:
+                real_balance_lines.append(f"{b.get('currency_code')}: <code>{avail}</code>")
+    except CryptoPayError as e:
+        real_balance_lines.append(f"Ошибка запроса баланса: <code>{e.message}</code>")
     except Exception:
-        pass
-    await cb_answer(call)
-    # refresh panel
-    call.data = "wd_list_pending"
-    await wd_list(call)
+        real_balance_lines.append("Не удалось получить баланс приложения — проверьте CRYPTO_PAY_TOKEN.")
+    real_balance_text = "\n".join(real_balance_lines) if real_balance_lines else "—"
 
-
-@router.callback_query(F.data.regexp(r"^wd_reject_\d+$"))
-async def wd_reject(call: CallbackQuery, bot: Bot):
-    if not await require_admin(call):
-        return
-    wid = int(call.data.split("_")[-1])
-    async with aiosqlite.connect(DB_NAME) as db:
-        cur = await db.execute("SELECT user_id, amount, status FROM withdrawals WHERE id=?", (wid,))
-        row = await cur.fetchone()
-        if not row or row[2] != "pending":
-            await cb_answer(call)
-            return
-        uid, amount, _ = row
-        cur = await db.execute(
-            "UPDATE withdrawals SET status='rejected' WHERE id=? AND status='pending'", (wid,)
-        )
-        if cur.rowcount:
-            await db.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, uid))
-        await db.commit()
-    try:
-        await bot.send_message(
-            uid,
-            tg(T_ERR, "🚫") + " × <b>Вывод отклонён.</b>\n━━━━━━━━━━━━━━━━\n"
-            f"<code>${amount:.2f}</code> возвращено на баланс.",
-            parse_mode="HTML",
-        )
-    except Exception:
-        pass
-    await cb_answer(call)
-    call.data = "wd_list_pending"
-    await wd_list(call)
+    text = (
+        tg(T_PAY, "🛒") + " × <b>Казна.</b>\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"<b>Реальный баланс приложения (@CryptoBot):</b>\n{real_balance_text}\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"┌ <b>Успешных выплат:</b> <code>{stats['n_success']}</code> на сумму <code>${stats['sum_success']:.2f}</code>\n"
+        f"├ <b>Неудачных выплат:</b> <code>{stats['n_failed']}</code> на сумму <code>${stats['sum_failed']:.2f}</code>\n"
+        f"├ <b>В обработке сейчас:</b> <code>{stats['n_processing']}</code>\n"
+        f"├ <b>Выплачено за 24ч:</b> <code>{stats['n_24h']}</code> на сумму <code>${stats['sum_24h']:.2f}</code>\n"
+        f"├ <b>Средняя выплата:</b> <code>${stats['avg']:.2f}</code>\n"
+        f"├ <b>Уникальных получателей:</b> <code>{stats['n_users']}</code>\n"
+        f"└ <b>Общий виртуальный баланс пользователей:</b> <code>${stats['total_balance']:.2f}</code>\n\n"
+        "Виртуальный баланс пользователей — это деньги, которые бот обязан выплатить. "
+        "Сверяйте его с реальным балансом приложения выше, чтобы вовремя пополнять казну."
+    )
+    await show_menu(call, text, back_to_admin_kb())
 

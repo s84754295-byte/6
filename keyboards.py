@@ -44,7 +44,7 @@ def cancel_numbers_kb(rows):
 
 def admin_panel_kb(is_owner: bool = False, bot_enabled: bool = True):
     b = InlineKeyboardBuilder()
-    b.button(text="Управление выплатами", callback_data="wd_panel", icon_custom_emoji_id=B_PAY)
+    b.button(text="Казна", callback_data="treasury", icon_custom_emoji_id=B_PAY)
     b.button(text="Управление ценами", callback_data="price_menu", icon_custom_emoji_id=B_MIN)
     b.button(text="Информация о боте", callback_data="stats", icon_custom_emoji_id=B_STATS)
     b.button(text="Массовая рассылка", callback_data="broadcast", icon_custom_emoji_id=B_CAST)
@@ -191,24 +191,4 @@ def subscribe_kb():
     b.button(text="Подписаться на канал", url=CHANNEL_URL, icon_custom_emoji_id=B_CAST)
     b.button(text="Проверить подписку", callback_data="check_sub", icon_custom_emoji_id=B_YES)
     b.adjust(1, 1)
-    return b.as_markup()
-
-
-def wd_item_actions_kb(withdraw_id: int, user_id: int):
-    b = InlineKeyboardBuilder()
-    b.button(text="Оплатить вывод", url=f"tg://user?id={user_id}", icon_custom_emoji_id=B_PAY)
-    b.button(text="Отметить оплаченным", callback_data=f"wd_mark_paid_{withdraw_id}", icon_custom_emoji_id=B_ACCEPT)
-    b.button(text="Отклонить вывод", callback_data=f"wd_reject_{withdraw_id}", icon_custom_emoji_id=B_REJECT)
-    b.button(text="Назад", callback_data="wd_panel", icon_custom_emoji_id=B_BACK)
-    b.adjust(2, 1, 1)
-    return b.as_markup()
-
-
-def wd_panel_kb():
-    b = InlineKeyboardBuilder()
-    b.button(text="Оплаченные заявки", callback_data="wd_list_paid", icon_custom_emoji_id=B_ACCEPT)
-    b.button(text="Отклонённые заявки", callback_data="wd_list_rejected", icon_custom_emoji_id=B_REJECT)
-    b.button(text="Активные заявки", callback_data="wd_list_pending", icon_custom_emoji_id=B_PAY)
-    b.button(text="Назад", callback_data="admin_panel", icon_custom_emoji_id=B_BACK)
-    b.adjust(2, 1, 1)
     return b.as_markup()
