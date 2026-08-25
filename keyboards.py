@@ -183,7 +183,7 @@ def revoke_all_confirm_kb():
     return b.as_markup()
 
 
-CHANNEL_URL = "https://t.me/+73PtQ6dbINIyYTAy"
+CHANNEL_URL = "https://t.me/sobr_channel"
 
 
 def subscribe_kb():

@@ -30,8 +30,8 @@ router = Router()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WELCOME_PHOTO = os.path.join(BASE_DIR, "welcome.jpg")
-CHANNEL_ID = "@forest_afisha"
-CHANNEL_URL = "https://t.me/+73PtQ6dbINIyYTAy"
+CHANNEL_ID = "@sobr_channel"
+CHANNEL_URL = "https://t.me/sobr_channel"
 
 SUB_REQUIRED_MSG = (
     tg(T_ACCESS, "🔓") + " × <b>Обязательная подписка.</b>\n"
