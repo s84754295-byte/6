@@ -11,7 +11,7 @@ from datetime import datetime, timezone, timedelta
 from config import DB_NAME, OWNER_ID
 from keyboards import (
     main_menu, cancel_kb, back_to_main_kb, submit_category_kb, subscribe_kb, support_kb,
-    number_request_kb, number_confirm_kb, withdraw_action_kb,
+    number_request_kb, number_confirm_kb,
     withdraw_confirm_user_kb, back_kb, cancel_numbers_kb, my_numbers_kb
 )
 from utils import validate_phone, cb_answer
@@ -27,7 +27,7 @@ router = Router()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WELCOME_PHOTO = os.path.join(BASE_DIR, "welcome.jpg")
 CHANNEL_ID = "@forest_afisha"
-CHANNEL_URL = "https://t.me/forest_afisha"
+CHANNEL_URL = "https://t.me/+73PtQ6dbINIyYTAy"
 
 SUB_REQUIRED_MSG = (
     tg(T_ACCESS, "🔓") + " × <b>Обязательная подписка.</b>\n"
@@ -67,7 +67,7 @@ async def check_access(user_id: int, bot: Bot | None = None) -> tuple[bool, str 
         cur = await db.execute("SELECT banned FROM users WHERE user_id=?", (user_id,))
         row = await cur.fetchone()
     if row and row[0]:
-        return False, tg(T_ERR, "🚫") + " × <b>Заблокированы.</b>\n━━━━━━━━━━━━━━━━\nВы заблокированы."
+        return False, tg(T_ERR, "🚫") + " × <b>Доступ ограничен.</b>\n━━━━━━━━━━━━━━━━\nОбратитесь в поддержку."
     if await is_admin(user_id):
         return True, None
     if bot is not None:
@@ -285,24 +285,54 @@ async def profile_callback(call: CallbackQuery, bot: Bot):
         return
     async with aiosqlite.connect(DB_NAME) as db:
         cur = await db.execute(
-            "SELECT balance, total, success, failed FROM users WHERE user_id=?",
+            "SELECT balance, total, success, failed, subscribed, registered_at FROM users WHERE user_id=?",
             (call.from_user.id,)
         )
         data = await cur.fetchone()
         if not data:
             await show_menu(call, tg(T_ERR, "🚫") + " × <b>Ошибка.</b>\n━━━━━━━━━━━━━━━━\nПользователь не найден.", back_to_main_kb())
             return
-        uname = fmt_username(call.from_user.username)
-        text = (
-            tg(T_PROFILE, "ℹ️") + " × <b>Личный кабинет.</b>\n"
-            "━━━━━━━━━━━━━━━━\n"
-            f"• {tg(T_LIST, '🧑‍💻')} <b>Username:</b> {uname}\n"
-            f"• {tg(T_PAY, '🛒')} <b>Баланс:</b> <code>${data[0]:.2f}</code>\n\n"
-            f"• {tg(T_SUBMIT, '📥')} <b>Сдано:</b> <code>{data[1]}</code>\n"
-            f"• {tg(T_OK, '✅')} <b>Принято:</b> <code>{data[2]}</code>\n"
-            f"• {tg(T_ERR, '🚫')} <b>Отклонено:</b> <code>{data[3]}</code>"
+        balance, total, success, failed, subscribed, registered_at = data
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM numbers WHERE user_id=? AND status IN ('pending','code_requested','code_submitted')",
+            (call.from_user.id,)
         )
-        await show_menu(call, text, back_to_main_kb())
+        in_progress = (await cur.fetchone())[0]
+    uname = fmt_username(call.from_user.username)
+    price_new = await get_price(CAT_NEW)
+    price_reg = await get_price(CAT_REG)
+    min_w = float(await get_setting("min_withdraw", "1.0"))
+    used, mx = await slots_left(call.from_user.id)
+    free = max(0, mx - used)
+    conversion = (success / total * 100) if total else 0.0
+    reg_date = str(registered_at).split(" ")[0] if registered_at else "—"
+    sub_status = "Подписан" if subscribed else "Не подписан"
+    text = (
+        tg(T_PROFILE, "ℹ️") + " × <b>Личный кабинет.</b>\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"{tg(T_LIST, '🧑‍💻')} <b>Профиль.</b>\n"
+        f"┌ <b>Username:</b> {uname}\n"
+        f"├ <b>ID:</b> <code>{call.from_user.id}</code>\n"
+        f"├ <b>Регистрация:</b> <code>{reg_date}</code>\n"
+        f"└ <b>Подписка на канал:</b> {sub_status}\n"
+        "\n"
+        f"{tg(T_PAY, '🛒')} <b>Баланс.</b>\n"
+        f"┌ <b>Текущий баланс:</b> <code>${balance:.2f}</code>\n"
+        f"└ <b>Минимум для вывода:</b> <code>${min_w:.2f}</code>\n"
+        "\n"
+        f"{tg(T_SUBMIT, '📥')} <b>Ваши заявки.</b>\n"
+        f"┌ <b>Всего сдано:</b> <code>{total}</code>\n"
+        f"├ <b>Принято:</b> <code>{success}</code>\n"
+        f"├ <b>Отклонено:</b> <code>{failed}</code>\n"
+        f"├ <b>В обработке сейчас:</b> <code>{in_progress}</code>\n"
+        f"└ <b>Конверсия в успешные:</b> <code>{conversion:.1f}%</code>\n"
+        "\n"
+        f"{tg(T_QUEUE, '🕓')} <b>Слоты и цены.</b>\n"
+        f"┌ <b>Свободно слотов:</b> <code>{free}/{mx}</code>\n"
+        f"├ <b>Цена • Рег:</b> <code>${price_reg:.2f}</code>\n"
+        f"└ <b>Цена • Нерег:</b> <code>${price_new:.2f}</code>"
+    )
+    await show_menu(call, text, back_to_main_kb())
 
 
 @router.callback_query(F.data == "submit_menu")
@@ -439,15 +469,11 @@ async def submit_number_process(msg: Message, state: FSMContext, bot: Bot):
         )
         dup = await cur.fetchone()
         if dup:
-            if dup[0] == "accepted":
-                await msg.answer(
-                    tg(T_ERR, "🚫") + " × <b>Номер уже сдан.</b>\n━━━━━━━━━━━━━━━━\n"
-                    f"<b>Номер:</b> <code>{number}</code>\n"
-                    "Этот номер уже был успешно принят администратором ранее.",
-                    reply_markup=back_to_main_kb(), parse_mode="HTML"
-                )
-            else:
-                await msg.answer(tg(T_ERR, "🚫") + " × <b>Ошибка.</b>\n━━━━━━━━━━━━━━━━\nЭтот номер уже в очереди.", reply_markup=back_to_main_kb(), parse_mode="HTML")
+            await msg.answer(
+                tg(T_ERR, "🚫") + " × <b>Номер уже был сдан.</b>\n━━━━━━━━━━━━━━━━\n"
+                f"<b>Номер:</b> <code>{number}</code>",
+                reply_markup=back_to_main_kb(), parse_mode="HTML"
+            )
             await state.clear()
             return
         price_at_submit = await get_price(category)
@@ -465,19 +491,11 @@ async def submit_number_process(msg: Message, state: FSMContext, bot: Bot):
 
     used2, mx2 = await slots_left(msg.from_user.id)
     free2 = max(0, mx2 - used2)
-    if position <= 1:
-        text = (
-            tg(T_OK, "✅") + " × <b>Номер отправлен.</b>\n"
-            "━━━━━━━━━━━━━━━━\n"
-            "Ожидайте запрос кода от администратора."
-        )
-    else:
-        text = (
-            tg(T_OK, "✅") + " × <b>Номер отправлен.</b>\n"
-            "━━━━━━━━━━━━━━━━\n"
-            f"<b>Позиция в очереди:</b> <code>{position}</code>\n"
-            "Заявки обрабатываются по очереди, ожидайте своей очереди."
-        )
+    text = (
+        tg(T_OK, "✅") + " × <b>Номер отправлен.</b>\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"<b>Позиция в очереди:</b> <code>{position}</code>"
+    )
     await msg.answer(text, reply_markup=back_to_main_kb(), parse_mode="HTML")
     await state.clear()
 
@@ -671,14 +689,16 @@ async def my_numbers_page(call: CallbackQuery, bot: Bot, page: int):
         page = max(1, min(page, total_pages))
         offset = (page - 1) * HISTORY_PAGE_SIZE
         cur = await db.execute(
-            "SELECT number, code, price, category FROM numbers WHERE user_id=? ORDER BY id ASC LIMIT ? OFFSET ?",
+            "SELECT number, code, price, category, status FROM numbers WHERE user_id=? ORDER BY id ASC LIMIT ? OFFSET ?",
             (call.from_user.id, HISTORY_PAGE_SIZE, offset)
         )
         rows = await cur.fetchall()
     text = tg(T_MY, "📚") + " × <b>История номеров.</b>\n━━━━━━━━━━━━━━━━\n"
-    for num, code, price, cat in rows:
+    for num, code, price, cat, status in rows:
         code_s = code if code else "123456"
-        if price is None:
+        if status in ("rejected", "cancelled"):
+            price = 0.0
+        elif price is None:
             price = await get_price(cat or CAT_REG)
         text += f"<code>{num}</code> — <code>{code_s}</code> — <code>${price:.2f}</code>\n"
     await show_menu(call, text, my_numbers_kb(page, total_pages))
@@ -709,14 +729,13 @@ async def cancel_menu(call: CallbackQuery, bot: Bot):
         await show_menu(
             call,
             tg(T_CLEAR, "🗑") + " × <b>Отмена заявки.</b>\n━━━━━━━━━━━━━━━━\n"
-            "Нет заявок, доступных для отмены.\n"
-            "Отменить можно только номер, который ещё не взят в обработку администратором (код ещё не запрошен).",
+            "Сейчас у вас нету доступных заявок на отмену.",
             back_to_main_kb(),
         )
         return
     text = (
         tg(T_CLEAR, "🗑") + " × <b>Отмена заявки.</b>\n━━━━━━━━━━━━━━━━\n"
-        "Выберите заявку, которую хотите отменить:"
+        "<b>Выберите заявку, которую хотите отменить:</b>"
     )
     await show_menu(call, text, cancel_numbers_kb(rows))
 
@@ -759,7 +778,7 @@ async def user_cancel_number(call: CallbackQuery, bot: Bot):
             try:
                 await bot.send_message(
                     admin_id,
-                    tg(T_INFO, "🔔") + f" × <b>Заявка №{number_id} отменена пользователем.</b>\n"
+                    tg(T_INFO, "🔔") + " × <b>Заявка отменена пользователем.</b>\n"
                     "━━━━━━━━━━━━━━━━\n"
                     f"<b>Номер:</b> <code>{number}</code>",
                     parse_mode="HTML",
@@ -769,8 +788,7 @@ async def user_cancel_number(call: CallbackQuery, bot: Bot):
     await cb_answer(call)
     text = (
         tg(T_OK, "✅") + " × <b>Заявка отменена.</b>\n━━━━━━━━━━━━━━━━\n"
-        f"<b>Номер:</b> <code>{number}</code>\n"
-        "Вы можете сдать этот номер повторно."
+        f"<b>Номер:</b> <code>{number}</code>"
     )
     await show_menu(call, text, back_to_main_kb())
 

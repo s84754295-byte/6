@@ -12,7 +12,7 @@ from utils import cb_answer
 from keyboards import (
     admin_panel_kb, back_to_admin_kb, cancel_kb, back_kb, price_menu_kb,
     access_panel_kb, number_request_kb, number_confirm_kb,
-    withdraw_item_kb, withdraw_action_kb, queue_menu_kb, wd_panel_kb, wd_item_actions_kb,
+    queue_menu_kb, wd_panel_kb, wd_item_actions_kb,
     clear_queue_confirm_kb, grant_all_confirm_kb, revoke_all_confirm_kb
 )
 from emojis import tg, T_HOME, T_ADMIN, T_QUEUE, T_OK, T_ERR, T_NEW, T_CODE, T_PAY, T_ACCESS, T_STATS, T_LIST, T_BROADCAST, T_PRICE, T_STOP, T_CLEAR, T_WARN, T_USERS, T_PROFILE, T_INFO, T_CHECK, T_SUBMIT, T_WITHDRAW, T_CAT
@@ -637,9 +637,6 @@ async def show_stats(call: CallbackQuery):
         active_users = (await (await db.execute(
             "SELECT COUNT(*) FROM users WHERE banned=0 AND subscribed=1"
         )).fetchone())[0]
-        banned_users = (await (await db.execute(
-            "SELECT COUNT(*) FROM users WHERE banned=1"
-        )).fetchone())[0]
         subscribed_users = (await (await db.execute(
             "SELECT COUNT(*) FROM users WHERE subscribed=1"
         )).fetchone())[0]
@@ -717,7 +714,6 @@ async def show_stats(call: CallbackQuery):
         f"{tg(T_USERS, '👥')} <b>Пользователи.</b>\n"
         f"┌ <b>Всего:</b> <code>{users_count}</code>\n"
         f"├ <b>Активных:</b> <code>{active_users}</code>\n"
-        f"├ <b>Заблокированных:</b> <code>{banned_users}</code>\n"
         f"├ <b>Подписанных на канал:</b> <code>{subscribed_users}</code>\n"
         f"├ <b>Одобренных:</b> <code>{approved_users}</code>\n"
         f"├ <b>Новых за 24ч:</b> <code>{new_24h}</code>\n"
@@ -802,126 +798,60 @@ async def broadcast_process(msg: Message, state: FSMContext, bot: Bot):
     await state.clear()
 
 
-# ---------- Пользователи ----------
-@router.callback_query(F.data == "users_list")
-async def users_list(call: CallbackQuery):
+# ---------- Обзор очереди ----------
+@router.callback_query(F.data == "queue_overview")
+async def queue_overview(call: CallbackQuery):
     if not await require_admin(call):
         return
     async with aiosqlite.connect(DB_NAME) as db:
         cur = await db.execute(
-            "SELECT COUNT(*) FROM users WHERE banned=0 AND subscribed=1"
+            "SELECT COUNT(*) FROM numbers WHERE status IN ('pending','code_requested','code_submitted')"
         )
-        active_count = (await cur.fetchone())[0]
+        in_queue = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(*) FROM numbers WHERE status='pending' AND notified_admin=1")
+        active_now = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(*) FROM numbers WHERE status='pending' AND notified_admin=0")
+        waiting_turn = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(*) FROM numbers WHERE status='code_requested'")
+        code_requested = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(*) FROM numbers WHERE status='code_submitted'")
+        code_submitted = (await cur.fetchone())[0]
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM numbers WHERE status IN ('pending','code_requested','code_submitted') AND category=?",
+            (CAT_REG,)
+        )
+        in_queue_reg = (await cur.fetchone())[0]
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM numbers WHERE status IN ('pending','code_requested','code_submitted') AND category=?",
+            (CAT_NEW,)
+        )
+        in_queue_new = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(*) FROM numbers WHERE status='accepted'")
+        accepted = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(*) FROM numbers WHERE status='rejected'")
+        rejected_total = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(*) FROM numbers WHERE status='cancelled'")
+        cancelled_by_user = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(*) FROM numbers")
+        total_ever = (await cur.fetchone())[0]
     text = (
-        tg(T_USERS, "👥") + " × <b>Активные пользователи.</b>\n"
+        tg(T_QUEUE, "🕓") + " × <b>Обзор очереди.</b>\n"
         "━━━━━━━━━━━━━━━━\n"
-        f"<b>Всего активных:</b> <code>{active_count}</code>"
+        f"┌ <b>Всего в очереди сейчас:</b> <code>{in_queue}</code>\n"
+        f"├ <b>Сейчас на рассмотрении:</b> <code>{active_now}</code>\n"
+        f"├ <b>Ждут своей очереди:</b> <code>{waiting_turn}</code>\n"
+        f"├ <b>Запрошен код:</b> <code>{code_requested}</code>\n"
+        f"├ <b>Код отправлен, на проверке:</b> <code>{code_submitted}</code>\n"
+        f"├ <b>MAX • Рег в очереди:</b> <code>{in_queue_reg}</code>\n"
+        f"└ <b>MAX • Нерег в очереди:</b> <code>{in_queue_new}</code>\n"
+        "\n"
+        f"{tg(T_OK, '✅')} <b>История обработки.</b>\n"
+        f"┌ <b>Принято всего:</b> <code>{accepted}</code>\n"
+        f"├ <b>Отклонено (админ / истёк срок):</b> <code>{rejected_total}</code>\n"
+        f"├ <b>Отменено пользователями:</b> <code>{cancelled_by_user}</code>\n"
+        f"└ <b>Заявок за всё время:</b> <code>{total_ever}</code>"
     )
-    await safe_edit(call, text, back_to_admin_kb())
-
-
-# ---------- Выводы ----------
-@router.callback_query(F.data == "withdrawals_admin")
-async def withdrawals_admin(call: CallbackQuery):
-    if not await require_admin(call):
-        return
-    async with aiosqlite.connect(DB_NAME) as db:
-        cur = await db.execute(
-            """
-            SELECT w.id, w.user_id, w.amount, w.created_at, u.username
-            FROM withdrawals w LEFT JOIN users u ON u.user_id = w.user_id
-            WHERE w.status = 'pending' ORDER BY w.id ASC LIMIT 15
-            """
-        )
-        rows = await cur.fetchall()
-    if not rows:
-        await safe_edit(call, tg(T_PAY, "🛒") + " × <b>Заявки на вывод.</b>\n━━━━━━━━━━━━━━━━\nАктивных заявок нет.", back_to_admin_kb())
-        return
-    await safe_edit(
-        call,
-        tg(T_PAY, "🛒") + f" × <b>Заявки на вывод.</b>\n━━━━━━━━━━━━━━━━\n<b>Всего:</b> <code>{len(rows)}</code>\nКнопки под каждой заявкой ниже.",
-        back_to_admin_kb()
-    )
-    for row in rows:
-        wid, uid, amount, created, uname = row
-        try:
-            await call.message.answer(
-                tg(T_PAY, "🛒") + f" <b>Заявка #{wid}.</b>\n"
-                f"<b>Username:</b> {('@'+uname) if uname else '@username'}\n"
-                f"<b>ID:</b> <code>{uid}</code>\n"
-                f"<b>Сумма:</b> <code>${amount:.2f}</code>\n"
-                f"{created}\n"
-                "━━━━━━━━━━━━━━━━",
-                reply_markup=withdraw_item_kb(wid),
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
-
-
-@router.callback_query(F.data.startswith("confirm_withdraw_"))
-async def confirm_withdraw(call: CallbackQuery, bot: Bot):
-    if not await is_admin(call.from_user.id):
-        await cb_answer(call)
-        return
-    withdraw_id = int(call.data.split("_")[-1])
-    async with aiosqlite.connect(DB_NAME) as db:
-        cur = await db.execute("SELECT user_id, amount, status FROM withdrawals WHERE id=?", (withdraw_id,))
-        row = await cur.fetchone()
-        if not row or row[2] != "pending":
-            await cb_answer(call)
-            return
-        user_id, amount, _ = row
-        cur = await db.execute(
-            "UPDATE withdrawals SET status='paid' WHERE id=? AND status='pending'",
-            (withdraw_id,),
-        )
-        if cur.rowcount == 0:
-            await cb_answer(call)
-            return
-        await db.commit()
-    try:
-        await bot.send_message(user_id, tg(T_OK, "✅") + " × <b>Вывод оплачен.</b>\n━━━━━━━━━━━━━━━━\n" + f"<b>Сумма:</b> <code>${amount:.2f}</code>", parse_mode="HTML")
-    except Exception:
-        pass
-    try:
-        await call.message.edit_text(tg(T_OK, "✅") + " × <b>Оплачено.</b>\n━━━━━━━━━━━━━━━━\n" + f"<b>Сумма:</b> <code>${amount:.2f}</code>", parse_mode="HTML")
-    except Exception:
-        pass
-    await cb_answer(call)
-
-
-@router.callback_query(F.data.startswith("reject_withdraw_"))
-async def reject_withdraw(call: CallbackQuery, bot: Bot):
-    if not await is_admin(call.from_user.id):
-        await cb_answer(call)
-        return
-    withdraw_id = int(call.data.split("_")[-1])
-    async with aiosqlite.connect(DB_NAME) as db:
-        cur = await db.execute("SELECT user_id, amount, status FROM withdrawals WHERE id=?", (withdraw_id,))
-        row = await cur.fetchone()
-        if not row or row[2] != "pending":
-            await cb_answer(call)
-            return
-        user_id, amount, _ = row
-        cur = await db.execute(
-            "UPDATE withdrawals SET status='rejected' WHERE id=? AND status='pending'",
-            (withdraw_id,),
-        )
-        if cur.rowcount == 0:
-            await cb_answer(call)
-            return
-        await db.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user_id))
-        await db.commit()
-    try:
-        await bot.send_message(user_id, tg(T_ERR, "🚫") + " × <b>Вывод отклонён.</b>\n━━━━━━━━━━━━━━━━\n" + f"<b>Сумма:</b> <code>${amount:.2f}</code>\nВозвращена на баланс.", parse_mode="HTML")
-    except Exception:
-        pass
-    try:
-        await call.message.edit_text(tg(T_ERR, "🚫") + " × <b>Отклонено.</b>\n━━━━━━━━━━━━━━━━\n" + f"<code>${amount:.2f}</code> возвращено на баланс.", parse_mode="HTML")
-    except Exception:
-        pass
-    await cb_answer(call)
+    await show_menu(call, text, back_to_admin_kb())
 
 
 # ---------- Доступ ----------
@@ -945,7 +875,7 @@ async def grant_all_ask(call: CallbackQuery):
     text = (
         tg(T_ACCESS, "🔓") + " × <b>Открыть доступ всем.</b>\n"
         "━━━━━━━━━━━━━━━━\n"
-        "Выдать доступ всем не заблокированным пользователям?"
+        "Выдать доступ всем пользователям?"
     )
     await safe_edit(call, text, grant_all_confirm_kb())
 
@@ -1142,7 +1072,7 @@ async def add_moder_cmd(msg: Message, command: CommandObject, state: FSMContext)
     if not command.args or not command.args.strip():
         await msg.answer(
             tg(T_OK, "✅") + " × <b>Добавить админа.</b>\n━━━━━━━━━━━━━━━━\n"
-            "<b>Использование:</b> <code>/add_moder ID</code>",
+            "<b>Использование:</b> /add_moder ID",
             parse_mode="HTML"
         )
         return
@@ -1175,7 +1105,7 @@ async def delete_moder_cmd(msg: Message, command: CommandObject, state: FSMConte
     if not command.args or not command.args.strip():
         await msg.answer(
             tg(T_ERR, "🚫") + " × <b>Удалить админа.</b>\n━━━━━━━━━━━━━━━━\n"
-            "<b>Использование:</b> <code>/delete_moder ID</code>",
+            "<b>Использование:</b> /delete_moder ID",
             parse_mode="HTML"
         )
         return
@@ -1226,18 +1156,38 @@ async def wd_panel(call: CallbackQuery):
     if not await require_admin(call):
         return
     async with aiosqlite.connect(DB_NAME) as db:
-        cur = await db.execute("SELECT COUNT(*) FROM withdrawals WHERE status='pending'")
-        n_pending = (await cur.fetchone())[0]
-        cur = await db.execute("SELECT COUNT(*) FROM withdrawals WHERE status='paid'")
-        n_paid = (await cur.fetchone())[0]
-        cur = await db.execute("SELECT COUNT(*) FROM withdrawals WHERE status='rejected'")
-        n_rej = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM withdrawals WHERE status='pending'")
+        n_pending, sum_pending = await cur.fetchone()
+        cur = await db.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM withdrawals WHERE status='paid'")
+        n_paid, sum_paid = await cur.fetchone()
+        cur = await db.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM withdrawals WHERE status='rejected'")
+        n_rej, sum_rej = await cur.fetchone()
+        cur = await db.execute("SELECT COUNT(*) FROM withdrawals")
+        n_total = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(DISTINCT user_id) FROM withdrawals")
+        n_users = (await cur.fetchone())[0]
+        cur = await db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(amount),0) FROM withdrawals "
+            "WHERE status='paid' AND created_at >= datetime('now','-1 day')"
+        )
+        n_paid_24h, sum_paid_24h = await cur.fetchone()
+        cur = await db.execute("SELECT COALESCE(MAX(amount),0) FROM withdrawals WHERE status='pending'")
+        max_pending = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COALESCE(SUM(balance),0) FROM users")
+        total_balance = (await cur.fetchone())[0]
+    avg_paid = (sum_paid / n_paid) if n_paid else 0.0
     text = (
         tg(T_PAY, "🛒") + " × <b>Выплаты.</b>\n"
         "━━━━━━━━━━━━━━━━\n"
-        f"<b>Активных:</b> <code>{n_pending}</code>\n"
-        f"<b>Оплаченных:</b> <code>{n_paid}</code>\n"
-        f"<b>Отклонённых:</b> <code>{n_rej}</code>"
+        f"┌ <b>Активных:</b> <code>{n_pending}</code> на сумму <code>${sum_pending:.2f}</code>\n"
+        f"├ <b>Оплаченных:</b> <code>{n_paid}</code> на сумму <code>${sum_paid:.2f}</code>\n"
+        f"├ <b>Отклонённых:</b> <code>{n_rej}</code> на сумму <code>${sum_rej:.2f}</code>\n"
+        f"├ <b>Всего заявок:</b> <code>{n_total}</code>\n"
+        f"├ <b>Уникальных пользователей:</b> <code>{n_users}</code>\n"
+        f"├ <b>Оплачено за 24ч:</b> <code>{n_paid_24h}</code> на сумму <code>${sum_paid_24h:.2f}</code>\n"
+        f"├ <b>Средняя выплата:</b> <code>${avg_paid:.2f}</code>\n"
+        f"├ <b>Крупнейшая активная заявка:</b> <code>${max_pending:.2f}</code>\n"
+        f"└ <b>Общий баланс пользователей:</b> <code>${total_balance:.2f}</code>"
     )
     await show_menu(call, text, wd_panel_kb())
 
@@ -1262,24 +1212,25 @@ async def wd_list(call: CallbackQuery):
             (st,),
         )
         rows = await cur.fetchall()
+        cur = await db.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM withdrawals WHERE status=?", (st,))
+        total_count, total_sum = await cur.fetchone()
     if not rows:
         await show_menu(call, tg(T_PAY, "🛒") + f" × <b>{title}.</b>\n━━━━━━━━━━━━━━━━\nЗаявок нет.", wd_panel_kb())
         return
     from aiogram.utils.keyboard import InlineKeyboardBuilder
     b = InlineKeyboardBuilder()
-    text = tg(T_PAY, "🛒") + f" × <b>{title}.</b>\n━━━━━━━━━━━━━━━━\n"
+    text = (
+        tg(T_PAY, "🛒") + f" × <b>{title}.</b>\n━━━━━━━━━━━━━━━━\n"
+        f"<b>Всего:</b> <code>{total_count}</code> на сумму <code>${total_sum:.2f}</code>\n"
+        f"<b>Показано:</b> <code>{len(rows)}</code>\n\n"
+    )
     for wid, uid, amount, uname in rows:
         uname_s = f"@{uname}" if uname else "@username"
+        text += f"{uname_s} | <code>{uid}</code> — <code>${amount:.2f}</code>\n"
         if st == "pending":
-            text += f"{uname_s} | <code>{uid}</code> — <code>${amount:.2f}</code>\n"
-            b.button(text=f"#{wid} ${amount:.2f}", callback_data=f"wd_open_{wid}")
-        else:
-            text += f"{uname_s} | <code>{uid}</code> — <code>${amount:.2f}</code>\n"
+            b.button(text=f"Открыть заявку #{wid} — ${amount:.2f}", callback_data=f"wd_open_{wid}")
     b.button(text="Назад", callback_data="wd_panel")
-    if st == "pending":
-        b.adjust(1)
-    else:
-        b.adjust(1)
+    b.adjust(1)
     await show_menu(call, text, b.as_markup())
 
 
