@@ -7,7 +7,7 @@ from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from config import BOT_TOKEN, OWNER_ID
-from database import init_db, get_admins, expire_code_requests
+from database import init_db, get_admins, expire_code_requests, expire_admin_pending
 from middleware import AntiFloodMiddleware
 from emojis import tg, T_WARN
 import user
@@ -17,7 +17,8 @@ logging.basicConfig(level=logging.INFO)
 
 
 async def code_expiry_watcher(bot: Bot):
-    """Каждые 15 секунд отменяет заявки, где истекло время на ввод кода."""
+    """Каждые 15 секунд отменяет заявки, где истекло время на ввод кода,
+    и заявки, которые админ не открыл (не запросил код) слишком долго."""
     while True:
         try:
             expired = await expire_code_requests()
@@ -29,6 +30,21 @@ async def code_expiry_watcher(bot: Bot):
                         tg(T_WARN, "⚠️") + " × <b>Время истекло.</b>\n━━━━━━━━━━━━━━━━\n"
                         f"<b>Номер:</b> <code>{number}</code>\n"
                         "Время на ввод кода истекло, заявка отменена.\n"
+                        "Вы можете сдать этот номер повторно.",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+
+            expired_admin = await expire_admin_pending()
+            for number_id, user_id, number in expired_admin:
+                await user.advance_queue(bot)
+                try:
+                    await bot.send_message(
+                        user_id,
+                        tg(T_WARN, "⚠️") + " × <b>Время истекло.</b>\n━━━━━━━━━━━━━━━━\n"
+                        f"<b>Номер:</b> <code>{number}</code>\n"
+                        "Администратор не отреагировал на заявку вовремя, она отменена.\n"
                         "Вы можете сдать этот номер повторно.",
                         parse_mode="HTML",
                     )

@@ -7,20 +7,22 @@ import aiosqlite
 import os
 import re
 import uuid
+import html
 from datetime import datetime, timezone, timedelta
 
 from config import DB_NAME, OWNER_ID, DEFAULT_ASSET
 from keyboards import (
     main_menu, cancel_kb, back_to_main_kb, submit_category_kb, subscribe_kb, support_kb,
     number_request_kb, number_confirm_kb,
-    withdraw_confirm_user_kb, back_kb, cancel_numbers_kb, my_numbers_kb
+    back_kb, my_numbers_kb
 )
 from utils import validate_phone, cb_answer
 from database import (
     get_setting, is_bot_enabled, is_admin, get_admins,
     ensure_user_record, get_price, count_queue, count_user_active_numbers, CAT_REG, CAT_NEW, CAT_LABEL, set_subscribed, slots_left, MAX_SLOTS,
     claim_next_queued_number, queue_position, get_username,
-    try_deduct_balance, refund_balance, create_withdrawal, mark_withdrawal
+    try_deduct_balance, refund_balance, create_withdrawal, mark_withdrawal,
+    is_category_enabled, get_subscribed_at
 )
 from cryptopay import cp, CryptoPayError
 from emojis import tg, T_HOME, T_QUEUE, T_QUEUE_ALL, T_QUEUE_OWN, T_PROFILE, T_SUBMIT, T_MY, T_WITHDRAW, T_OK, T_ERR, T_NEW, T_CODE, T_PAY, T_ACCESS, T_STOP, T_CAT, T_WARN, T_SUPPORT, T_LIST, T_HISTORY_ITEM, T_AMOUNT, T_CLEAR, T_INFO
@@ -160,10 +162,26 @@ async def build_main_menu_text(user_id: int) -> str:
     queue = await count_queue()
     used, mx = await slots_left(user_id)
     free = max(0, mx - used)
+    wallet_line = ""
+    try:
+        balances = await cp.get_balance()
+        avail = 0.0
+        for b in balances:
+            if b.get("currency_code") == DEFAULT_ASSET:
+                raw = b.get("available", b.get("amount", "0"))
+                try:
+                    avail = float(raw or 0)
+                except (TypeError, ValueError):
+                    avail = 0.0
+                break
+        wallet_line = f"├ {tg(T_PAY, '🛒')} <b>Доступно к выводу:</b> <code>${avail:.2f}</code>\n"
+    except Exception:
+        wallet_line = ""
     return (
         tg(T_HOME, "🏠") + " × <b>Главное меню.</b>\n"
         "━━━━━━━━━━━━━━━━\n"
         f"┌ {tg(T_STOP, '🖥')} <b>Статус работы:</b> {status}\n"
+        f"{wallet_line}"
         f"├ {tg(T_PAY, '🛒')} <b>Прайс:</b> Нерег - (<code>${price_new:.2f}</code>) | Рег - (<code>${price_reg:.2f}</code>)\n"
         f"├ {tg(T_QUEUE, '🕓')} <b>Очередь номеров:</b> <code>{queue}</code>\n"
         f"└ {tg(T_CAT, '⭐️')} <b>Слотов:</b> <code>{free}/10</code>"
@@ -289,14 +307,14 @@ async def profile_callback(call: CallbackQuery, bot: Bot):
         return
     async with aiosqlite.connect(DB_NAME) as db:
         cur = await db.execute(
-            "SELECT balance, total, success, failed, subscribed, registered_at FROM users WHERE user_id=?",
+            "SELECT balance, total, success, failed, subscribed, subscribed_at, registered_at FROM users WHERE user_id=?",
             (call.from_user.id,)
         )
         data = await cur.fetchone()
         if not data:
             await show_menu(call, tg(T_ERR, "🚫") + " × <b>Ошибка.</b>\n━━━━━━━━━━━━━━━━\nПользователь не найден.", back_to_main_kb())
             return
-        balance, total, success, failed, subscribed, registered_at = data
+        balance, total, success, failed, subscribed, subscribed_at, registered_at = data
         cur = await db.execute(
             "SELECT COUNT(*) FROM numbers WHERE user_id=? AND status IN ('pending','code_requested','code_submitted')",
             (call.from_user.id,)
@@ -310,7 +328,7 @@ async def profile_callback(call: CallbackQuery, bot: Bot):
     free = max(0, mx - used)
     conversion = (success / total * 100) if total else 0.0
     reg_date = str(registered_at).split(" ")[0] if registered_at else "—"
-    sub_status = "Подписан" if subscribed else "Не подписан"
+    sub_date = str(subscribed_at).split(" ")[0] if subscribed_at else "—"
     text = (
         tg(T_PROFILE, "ℹ️") + " × <b>Личный кабинет.</b>\n"
         "━━━━━━━━━━━━━━━━\n"
@@ -318,7 +336,7 @@ async def profile_callback(call: CallbackQuery, bot: Bot):
         f"┌ <b>Username:</b> {uname}\n"
         f"├ <b>ID:</b> <code>{call.from_user.id}</code>\n"
         f"├ <b>Регистрация:</b> <code>{reg_date}</code>\n"
-        f"└ <b>Подписка на канал:</b> {sub_status}\n"
+        f"└ <b>В канале с:</b> <code>{sub_date}</code>\n"
         "\n"
         f"{tg(T_PAY, '🛒')} <b>Баланс.</b>\n"
         f"┌ <b>Текущий баланс:</b> <code>${balance:.2f}</code>\n"
@@ -384,6 +402,15 @@ async def submit_category_chosen(call: CallbackQuery, state: FSMContext, bot: Bo
         category = CAT_REG
     else:
         category = CAT_NEW
+    if not await is_category_enabled(category) and not await is_admin(call.from_user.id):
+        await cb_answer(call)
+        await call.message.answer(
+            tg(T_STOP, "🖥") + f" × <b>{CAT_LABEL[category]} временно недоступна.</b>\n"
+            "━━━━━━━━━━━━━━━━\n"
+            "Приём номеров по этой категории приостановлен администратором. Попробуйте позже.",
+            parse_mode="HTML",
+        )
+        return
     price = await get_price(category)
     label = CAT_LABEL[category]
     await state.update_data(category=category)
@@ -465,6 +492,16 @@ async def submit_number_process(msg: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     category = data.get("category", CAT_REG)
     label = CAT_LABEL.get(category, category)
+    if not await is_category_enabled(category) and not await is_admin(msg.from_user.id):
+        await msg.answer(
+            tg(T_STOP, "🖥") + f" × <b>{label} временно недоступна.</b>\n"
+            "━━━━━━━━━━━━━━━━\n"
+            "Приём номеров по этой категории приостановлен администратором. Попробуйте позже.",
+            reply_markup=back_to_main_kb(),
+            parse_mode="HTML",
+        )
+        await state.clear()
+        return
     async with aiosqlite.connect(DB_NAME) as db:
         cur = await db.execute(
             "SELECT status FROM numbers WHERE number=? AND status IN ('pending','code_requested','code_submitted','accepted') "
@@ -708,95 +745,6 @@ async def my_numbers_page(call: CallbackQuery, bot: Bot, page: int):
     await show_menu(call, text, my_numbers_kb(page, total_pages))
 
 
-@router.callback_query(F.data == "cancel_menu")
-async def cancel_menu(call: CallbackQuery, bot: Bot):
-    ok, err = await check_access(call.from_user.id, bot)
-    if not ok:
-        await cb_answer(call)
-        return
-    async with aiosqlite.connect(DB_NAME) as db:
-        cur = await db.execute(
-            """
-            SELECT id, number, seq FROM (
-                SELECT id, number, status,
-                       ROW_NUMBER() OVER (ORDER BY id ASC) AS seq
-                FROM numbers
-                WHERE user_id=?
-            )
-            WHERE status='pending'
-            ORDER BY id ASC
-            """,
-            (call.from_user.id,)
-        )
-        rows = await cur.fetchall()
-    if not rows:
-        await show_menu(
-            call,
-            tg(T_CLEAR, "🗑") + " × <b>Отмена заявки.</b>\n━━━━━━━━━━━━━━━━\n"
-            "Сейчас у вас нету доступных заявок на отмену.",
-            back_to_main_kb(),
-        )
-        return
-    text = (
-        tg(T_CLEAR, "🗑") + " × <b>Отмена заявки.</b>\n━━━━━━━━━━━━━━━━\n"
-        "<b>Выберите заявку, которую хотите отменить:</b>"
-    )
-    await show_menu(call, text, cancel_numbers_kb(rows))
-
-
-@router.callback_query(F.data.regexp(r"^user_cancel_\d+$"))
-async def user_cancel_number(call: CallbackQuery, bot: Bot):
-    ok, err = await check_access(call.from_user.id, bot)
-    if not ok:
-        await cb_answer(call)
-        return
-    number_id = int(call.data.split("_")[2])
-    async with aiosqlite.connect(DB_NAME) as db:
-        cur = await db.execute(
-            "SELECT number, status, notified_admin FROM numbers WHERE id=? AND user_id=?",
-            (number_id, call.from_user.id),
-        )
-        row = await cur.fetchone()
-        if not row or row[1] != "pending":
-            await cb_answer(call)
-            await call.message.answer(
-                tg(T_ERR, "🚫") + " × <b>Ошибка.</b>\n━━━━━━━━━━━━━━━━\n"
-                "Эту заявку уже нельзя отменить — она в обработке или уже закрыта.",
-                parse_mode="HTML",
-            )
-            return
-        number, _, notified_admin = row
-        cur = await db.execute(
-            "UPDATE numbers SET status='cancelled' WHERE id=? AND status='pending'",
-            (number_id,),
-        )
-        if cur.rowcount == 0:
-            await cb_answer(call)
-            return
-        await db.execute("UPDATE users SET failed = failed + 1 WHERE user_id=?", (call.from_user.id,))
-        await db.commit()
-    if notified_admin:
-        await advance_queue(bot)
-        admins = await get_admins()
-        for admin_id in admins:
-            try:
-                await bot.send_message(
-                    admin_id,
-                    tg(T_INFO, "🔔") + " × <b>Заявка отменена пользователем.</b>\n"
-                    "━━━━━━━━━━━━━━━━\n"
-                    f"<b>Номер:</b> <code>{number}</code>",
-                    parse_mode="HTML",
-                )
-            except Exception:
-                pass
-    await cb_answer(call)
-    text = (
-        tg(T_OK, "✅") + " × <b>Заявка отменена.</b>\n━━━━━━━━━━━━━━━━\n"
-        f"<b>Номер:</b> <code>{number}</code>"
-    )
-    await show_menu(call, text, back_to_main_kb())
-
-
 @router.callback_query(F.data == "withdraw")
 async def withdraw_start(call: CallbackQuery, state: FSMContext, bot: Bot):
     ok, err = await check_access(call.from_user.id, bot)
@@ -825,8 +773,7 @@ async def withdraw_start(call: CallbackQuery, state: FSMContext, bot: Bot):
         text = (
             tg(T_WITHDRAW, "💼") + " × <b>Вывод средств.</b>\n"
             "━━━━━━━━━━━━━━━━\n"
-            "Деньги придут мгновенно на ваш кошелёк в @CryptoBot.\n"
-            f"{tg(T_AMOUNT, '👝')} <b>Введите сумму вывода:</b>"
+            "<b>Введите сумму вывода:</b>"
         )
         await show_menu(call, text, cancel_kb())
         await state.set_state(WithdrawState.waiting_amount)
@@ -851,48 +798,8 @@ async def withdraw_amount(msg: Message, state: FSMContext, bot: Bot):
             reply_markup=cancel_kb(), parse_mode="HTML"
         )
         return
-    async with aiosqlite.connect(DB_NAME) as db:
-        cur = await db.execute("SELECT balance FROM users WHERE user_id=?", (msg.from_user.id,))
-        balance = (await cur.fetchone())[0]
-        if amount > balance:
-            await msg.answer(
-                tg(T_ERR, "🚫") + " × <b>Недостаточно средств.</b>\n━━━━━━━━━━━━━━━━\n"
-                f"{tg(T_PAY, '🛒')} <b>Баланс:</b> <code>${balance:.2f}</code>",
-                reply_markup=back_to_main_kb(), parse_mode="HTML"
-            )
-            await state.clear()
-            return
-    await state.update_data(amount=amount, balance=balance)
-    await msg.answer(
-        tg(T_PAY, "🛒") + " × <b>Проверьте заявку.</b>\n"
-        "━━━━━━━━━━━━━━━━\n"
-        f"<b>Сумма:</b> <code>${amount:.2f}</code>\n"
-        f"<b>Баланс:</b> <code>${balance:.2f}</code>",
-        reply_markup=withdraw_confirm_user_kb(),
-        parse_mode="HTML"
-    )
 
-
-@router.callback_query(F.data == "withdraw_user_yes")
-async def withdraw_user_confirm(call: CallbackQuery, state: FSMContext, bot: Bot):
-    ok, err = await check_access(call.from_user.id, bot)
-    if not ok:
-        await cb_answer(call)
-        return
-    ok_on, off_msg = await require_service_on(call.from_user.id)
-    if not ok_on:
-        await cb_answer(call)
-        await call.message.answer(off_msg, parse_mode="HTML")
-        await state.clear()
-        return
-    data = await state.get_data()
-    amount = data.get("amount")
-    if amount is None:
-        await cb_answer(call)
-        await state.clear()
-        return
-    amount = float(amount)
-    user_id = call.from_user.id
+    user_id = msg.from_user.id
 
     # 1. Атомарно списываем виртуальный баланс ДО реального перевода —
     #    чтобы пользователь не смог вывести больше, чем у него есть.
@@ -902,13 +809,12 @@ async def withdraw_user_confirm(call: CallbackQuery, state: FSMContext, bot: Bot
             cur = await db.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
             row = await cur.fetchone()
         balance = row[0] if row else 0
-        await call.message.edit_text(
+        await msg.answer(
             tg(T_ERR, "🚫") + " × <b>Недостаточно средств.</b>\n━━━━━━━━━━━━━━━━\n"
             f"{tg(T_PAY, '🛒')} <b>Баланс:</b> <code>${balance:.2f}</code>",
             reply_markup=back_to_main_kb(), parse_mode="HTML"
         )
         await state.clear()
-        await call.answer()
         return
 
     # 2. Идемпотентный ключ генерируется и сохраняется ДО вызова transfer,
@@ -921,12 +827,9 @@ async def withdraw_user_confirm(call: CallbackQuery, state: FSMContext, bot: Bot
         f"<b>Сумма:</b> <code>${amount:.2f}</code>\n"
         "Отправляем на ваш кошелёк в @CryptoBot..."
     )
-    try:
-        await call.message.edit_text(processing_text, parse_mode="HTML")
-    except Exception:
-        pass
+    processing_msg = await msg.answer(processing_text, parse_mode="HTML")
 
-    # 3. Реальная мгновенная отправка денег из казны на кошелёк пользователя в @CryptoBot.
+    # 3. Реальная мгновенная отправка денег из резерва на кошелёк пользователя в @CryptoBot.
     try:
         await cp.transfer(
             user_id=user_id,
@@ -943,31 +846,30 @@ async def withdraw_user_confirm(call: CallbackQuery, state: FSMContext, bot: Bot
                 tg(T_ERR, "🚫") + " × <b>Не удалось выполнить вывод.</b>\n━━━━━━━━━━━━━━━━\n"
                 "Похоже, вы ни разу не открывали @CryptoBot.\n"
                 "Откройте его, нажмите /start, затем повторите вывод.\n"
-                f"<code>${amount:.2f}</code> возвращено на баланс."
+                f"<b>Сумма:</b> <code>${amount:.2f}</code> возвращена на баланс."
             )
         else:
             fail_text = (
                 tg(T_ERR, "🚫") + " × <b>Не удалось выполнить вывод.</b>\n━━━━━━━━━━━━━━━━\n"
-                f"<code>${amount:.2f}</code> возвращено на баланс."
+                f"<b>Сумма:</b> <code>${amount:.2f}</code> возвращена на баланс."
             )
         try:
-            await call.message.edit_text(fail_text, reply_markup=back_to_main_kb(), parse_mode="HTML")
+            await processing_msg.edit_text(fail_text, reply_markup=back_to_main_kb(), parse_mode="HTML")
         except Exception:
-            await call.message.answer(fail_text, reply_markup=back_to_main_kb(), parse_mode="HTML")
+            await msg.answer(fail_text, reply_markup=back_to_main_kb(), parse_mode="HTML")
         for admin_id in await get_admins():
             try:
                 await bot.send_message(
                     admin_id,
                     tg(T_ERR, "🚫") + " × <b>Вывод не выполнен.</b>\n━━━━━━━━━━━━━━━━\n"
-                    f"<b>От пользователя:</b> {fmt_username(call.from_user.username)}\n"
+                    f"<b>От пользователя:</b> {fmt_username(msg.from_user.username)}\n"
                     f"<b>Сумма:</b> <code>${amount:.2f}</code>\n"
-                    f"<b>Ошибка:</b> <code>{e.message}</code>",
+                    f"<b>Ошибка:</b> {html.escape(str(e.message))}",
                     parse_mode="HTML",
                 )
             except Exception:
                 pass
         await state.clear()
-        await cb_answer(call)
         return
 
     await mark_withdrawal(withdrawal_id, "success")
@@ -977,29 +879,18 @@ async def withdraw_user_confirm(call: CallbackQuery, state: FSMContext, bot: Bot
         "Отправлено на ваш кошелёк в @CryptoBot."
     )
     try:
-        await call.message.edit_text(ok_text, reply_markup=back_to_main_kb(), parse_mode="HTML")
+        await processing_msg.edit_text(ok_text, reply_markup=back_to_main_kb(), parse_mode="HTML")
     except Exception:
-        await call.message.answer(ok_text, reply_markup=back_to_main_kb(), parse_mode="HTML")
+        await msg.answer(ok_text, reply_markup=back_to_main_kb(), parse_mode="HTML")
     for admin_id in await get_admins():
         try:
             await bot.send_message(
                 admin_id,
                 tg(T_WITHDRAW, "💼") + " × <b>Автовыплата выполнена.</b>\n━━━━━━━━━━━━━━━━\n"
-                f"<b>От пользователя:</b> {fmt_username(call.from_user.username)}\n"
+                f"<b>От пользователя:</b> {fmt_username(msg.from_user.username)}\n"
                 f"<b>Сумма:</b> <code>${amount:.2f}</code>",
                 parse_mode="HTML",
             )
         except Exception:
             pass
     await state.clear()
-    await cb_answer(call)
-
-
-@router.callback_query(F.data == "withdraw_user_no")
-async def withdraw_user_cancel(call: CallbackQuery, state: FSMContext, bot: Bot):
-    await state.clear()
-    admin = await is_admin(call.from_user.id)
-    display = call.from_user.first_name or call.from_user.username or "пользователь"
-    text = await build_main_menu_text(call.from_user.id)
-    await show_menu(call, text, main_menu(call.from_user.id, admin))
-    await cb_answer(call)

@@ -34,6 +34,14 @@ async def init_db():
             await db.execute("ALTER TABLE users ADD COLUMN subscribed INTEGER DEFAULT 0")
         except Exception:
             pass
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN subscribed_at TIMESTAMP")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN banned_at TIMESTAMP")
+        except Exception:
+            pass
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS numbers (
@@ -63,6 +71,10 @@ async def init_db():
             await db.execute(
                 "UPDATE numbers SET notified_admin=1 WHERE status IN ('pending','code_requested','code_submitted')"
             )
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE numbers ADD COLUMN notified_at TIMESTAMP")
         except Exception:
             pass
         try:
@@ -151,6 +163,16 @@ async def is_bot_enabled() -> bool:
     return (await get_setting("bot_enabled", "1")) == "1"
 
 
+async def is_category_enabled(category: str) -> bool:
+    key = "cat_enabled_registered" if category == CAT_REG else "cat_enabled_unregistered"
+    return (await get_setting(key, "1")) == "1"
+
+
+async def set_category_enabled(category: str, value: bool) -> None:
+    key = "cat_enabled_registered" if category == CAT_REG else "cat_enabled_unregistered"
+    await set_setting(key, "1" if value else "0")
+
+
 async def get_admins() -> list[int]:
     async with aiosqlite.connect(DB_NAME) as db:
         cur = await db.execute("SELECT user_id FROM admins")
@@ -214,8 +236,38 @@ async def is_approved(user_id: int) -> bool:
 
 async def set_subscribed(user_id: int, value: int = 1) -> None:
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET subscribed=? WHERE user_id=?", (1 if value else 0, user_id))
+        if value:
+            await db.execute(
+                "UPDATE users SET subscribed=1, subscribed_at=COALESCE(subscribed_at, CURRENT_TIMESTAMP) WHERE user_id=?",
+                (user_id,),
+            )
+        else:
+            await db.execute("UPDATE users SET subscribed=0 WHERE user_id=?", (user_id,))
         await db.commit()
+
+
+async def get_subscribed_at(user_id: int) -> str | None:
+    async with aiosqlite.connect(DB_NAME) as db:
+        cur = await db.execute("SELECT subscribed_at FROM users WHERE user_id=?", (user_id,))
+        row = await cur.fetchone()
+        return row[0] if row and row[0] else None
+
+
+async def set_banned(user_id: int, value: int = 1) -> bool:
+    async with aiosqlite.connect(DB_NAME) as db:
+        cur = await db.execute(
+            "UPDATE users SET banned=?, banned_at=CASE WHEN ?=1 THEN CURRENT_TIMESTAMP ELSE NULL END WHERE user_id=?",
+            (value, value, user_id),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def is_banned(user_id: int) -> bool:
+    async with aiosqlite.connect(DB_NAME) as db:
+        cur = await db.execute("SELECT banned FROM users WHERE user_id=?", (user_id,))
+        row = await cur.fetchone()
+        return bool(row and row[0])
 
 
 async def set_approved(user_id: int, value: int = 1) -> bool:
@@ -247,16 +299,17 @@ async def ensure_user_record(user_id: int, username: str | None):
 
 
 async def clear_queue(category: str | None = None) -> int:
-    """Удаляет заявки в статусах ожидания. category=None — все."""
+    """Снимает заявки в статусах ожидания с очереди (status='cancelled').
+    Записи не удаляются физически — вся статистика бота сохраняется. category=None — все."""
     async with aiosqlite.connect(DB_NAME) as db:
         if category:
             cur = await db.execute(
-                "DELETE FROM numbers WHERE status IN ('pending','code_requested','code_submitted') AND category=?",
+                "UPDATE numbers SET status='cancelled' WHERE status IN ('pending','code_requested','code_submitted') AND category=?",
                 (category,)
             )
         else:
             cur = await db.execute(
-                "DELETE FROM numbers WHERE status IN ('pending','code_requested','code_submitted')"
+                "UPDATE numbers SET status='cancelled' WHERE status IN ('pending','code_requested','code_submitted')"
             )
         await db.commit()
         return cur.rowcount
@@ -318,7 +371,10 @@ async def claim_next_queued_number():
         if not row:
             return None
         number_id = row[0]
-        await db.execute("UPDATE numbers SET notified_admin=1 WHERE id=?", (number_id,))
+        await db.execute(
+            "UPDATE numbers SET notified_admin=1, notified_at=? WHERE id=?",
+            (datetime.now(timezone.utc).isoformat(), number_id),
+        )
         await db.commit()
         return row
 
@@ -335,6 +391,45 @@ async def queue_position(number_id: int) -> int:
 
 
 CODE_TIMEOUT_MINUTES = 2
+ADMIN_RESPONSE_TIMEOUT_MINUTES = 20
+
+
+async def expire_admin_pending() -> list[tuple[int, int, str]]:
+    """
+    Находит заявки, которые уже показаны админу (status='pending', notified_admin=1),
+    но админ не запросил код дольше ADMIN_RESPONSE_TIMEOUT_MINUTES минут.
+    Автоматически отменяет их (status='cancelled') — номер и слот освобождаются
+    для повторной сдачи. Возвращает список (number_id, user_id, number) для уведомления.
+    """
+    async with aiosqlite.connect(DB_NAME) as db:
+        cur = await db.execute(
+            "SELECT id, user_id, number, notified_at FROM numbers WHERE status='pending' AND notified_admin=1"
+        )
+        rows = await cur.fetchall()
+        expired = []
+        now = datetime.now(timezone.utc)
+        for number_id, user_id, number, notified_at in rows:
+            if not notified_at:
+                continue
+            try:
+                notified = datetime.fromisoformat(notified_at)
+                if notified.tzinfo is None:
+                    notified = notified.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            if now - notified > timedelta(minutes=ADMIN_RESPONSE_TIMEOUT_MINUTES):
+                expired.append((number_id, user_id, number))
+        if expired:
+            ids = [e[0] for e in expired]
+            placeholders = ",".join("?" * len(ids))
+            await db.execute(
+                f"UPDATE numbers SET status='cancelled' WHERE id IN ({placeholders}) AND status='pending'",
+                ids,
+            )
+            for _, user_id, _ in expired:
+                await db.execute("UPDATE users SET failed = failed + 1 WHERE user_id=?", (user_id,))
+            await db.commit()
+        return expired
 
 
 async def expire_code_requests() -> list[tuple[int, int, str]]:
@@ -423,10 +518,14 @@ async def get_treasury_stats() -> dict:
     async with aiosqlite.connect(DB_NAME) as db:
         cur = await db.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM withdrawals WHERE status='success'")
         n_success, sum_success = await cur.fetchone()
+        cur = await db.execute("SELECT COUNT(DISTINCT user_id) FROM withdrawals WHERE status='success'")
+        n_success_users = (await cur.fetchone())[0]
         cur = await db.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM withdrawals WHERE status='failed'")
         n_failed, sum_failed = await cur.fetchone()
-        cur = await db.execute("SELECT COUNT(*) FROM withdrawals WHERE status='processing'")
-        n_processing = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(DISTINCT user_id) FROM withdrawals WHERE status='failed'")
+        n_failed_users = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM withdrawals WHERE status='processing'")
+        n_processing, sum_processing = await cur.fetchone()
         cur = await db.execute(
             "SELECT COUNT(*), COALESCE(SUM(amount),0) FROM withdrawals "
             "WHERE status='success' AND created_at >= datetime('now','-1 day')"
@@ -438,9 +537,9 @@ async def get_treasury_stats() -> dict:
         n_users = (await cur.fetchone())[0]
     avg = (sum_success / n_success) if n_success else 0.0
     return {
-        "n_success": n_success, "sum_success": sum_success,
-        "n_failed": n_failed, "sum_failed": sum_failed,
-        "n_processing": n_processing,
+        "n_success": n_success, "sum_success": sum_success, "n_success_users": n_success_users,
+        "n_failed": n_failed, "sum_failed": sum_failed, "n_failed_users": n_failed_users,
+        "n_processing": n_processing, "sum_processing": sum_processing,
         "n_24h": n_24h, "sum_24h": sum_24h,
         "total_balance": total_balance,
         "n_users": n_users,

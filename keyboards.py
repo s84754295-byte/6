@@ -9,9 +9,8 @@ def main_menu(user_id: int, is_admin: bool = False):
     b.button(text="Вывод средств", callback_data="withdraw", icon_custom_emoji_id=B_WITHDRAW)
     b.button(text="История заявок", callback_data="my_numbers", icon_custom_emoji_id=B_MY)
     b.button(text="Очередь номеров", callback_data="public_queue", icon_custom_emoji_id=B_QUEUE)
-    b.button(text="Отменить заявку", callback_data="cancel_menu", icon_custom_emoji_id=B_CLR_REG)
     b.button(text="Служба поддержки", callback_data="support", icon_custom_emoji_id=B_SUPPORT)
-    b.adjust(1, 2, 2, 1, 1)
+    b.adjust(1, 2, 2, 1)
     return b.as_markup()
 
 
@@ -32,29 +31,38 @@ def submit_category_kb():
     return b.as_markup()
 
 
-def cancel_numbers_kb(rows):
-    """rows: список (number_id, seq, number) заявок пользователя в статусе 'pending'."""
+def admin_panel_kb(is_owner: bool = False, bot_enabled: bool = True):
     b = InlineKeyboardBuilder()
-    for number_id, seq, number in rows:
-        b.button(text=number, callback_data=f"user_cancel_{number_id}", icon_custom_emoji_id=B_REJECT)
-    b.button(text="Назад", callback_data="main_menu", icon_custom_emoji_id=B_BACK)
-    b.adjust(1)
+    b.button(text="Резерв", callback_data="treasury", icon_custom_emoji_id=B_PAY)
+    b.button(text="Цены", callback_data="price_menu", icon_custom_emoji_id=B_MIN)
+    b.button(text="Информация", callback_data="stats", icon_custom_emoji_id=B_STATS)
+    b.button(text="Рассылка", callback_data="broadcast", icon_custom_emoji_id=B_CAST)
+    b.button(text="Доступ", callback_data="access_panel", icon_custom_emoji_id=B_ACCESS)
+    b.button(text="Очистка", callback_data="clear_queue_menu", icon_custom_emoji_id=B_CLR_REG)
+    b.button(text="Категории", callback_data="categories_menu", icon_custom_emoji_id=B_STOP)
+    b.adjust(2, 2, 2, 1)
     return b.as_markup()
 
 
-def admin_panel_kb(is_owner: bool = False, bot_enabled: bool = True):
+def categories_menu_kb(bot_enabled: bool, reg_enabled: bool, new_enabled: bool):
     b = InlineKeyboardBuilder()
-    b.button(text="Казна", callback_data="treasury", icon_custom_emoji_id=B_PAY)
-    b.button(text="Управление ценами", callback_data="price_menu", icon_custom_emoji_id=B_MIN)
-    b.button(text="Информация о боте", callback_data="stats", icon_custom_emoji_id=B_STATS)
-    b.button(text="Массовая рассылка", callback_data="broadcast", icon_custom_emoji_id=B_CAST)
-    b.button(text="Обзор очереди", callback_data="queue_overview", icon_custom_emoji_id=B_QUEUE)
-    b.button(text="Очистить очередь", callback_data="clear_queue_menu", icon_custom_emoji_id=B_CLR_REG)
-    if bot_enabled:
-        b.button(text="Остановить бота", callback_data="bot_stop", icon_custom_emoji_id=B_STOP)
-    else:
-        b.button(text="Запустить бота", callback_data="bot_start", icon_custom_emoji_id=B_START)
-    b.adjust(2, 2, 2, 1)
+    b.button(
+        text=("Остановить всё" if bot_enabled else "Запустить всё"),
+        callback_data=("bot_stop" if bot_enabled else "bot_start"),
+        icon_custom_emoji_id=(B_STOP if bot_enabled else B_START),
+    )
+    b.button(
+        text=("Остановить Рег" if reg_enabled else "Запустить Рег"),
+        callback_data=("cat_stop_registered" if reg_enabled else "cat_start_registered"),
+        icon_custom_emoji_id=(B_STOP if reg_enabled else B_START),
+    )
+    b.button(
+        text=("Остановить Нерег" if new_enabled else "Запустить Нерег"),
+        callback_data=("cat_stop_unregistered" if new_enabled else "cat_start_unregistered"),
+        icon_custom_emoji_id=(B_STOP if new_enabled else B_START),
+    )
+    b.button(text="Назад", callback_data="admin_panel", icon_custom_emoji_id=B_BACK)
+    b.adjust(1, 2, 1)
     return b.as_markup()
 
 
@@ -62,19 +70,9 @@ def admin_panel_kb(is_owner: bool = False, bot_enabled: bool = True):
 
 def price_menu_kb():
     b = InlineKeyboardBuilder()
-    b.button(text="MAX • Незарегистрированный", callback_data="set_price_unregistered", icon_custom_emoji_id=B_PRICE_NEW)
-    b.button(text="MAX • Зарегистрированный", callback_data="set_price_registered", icon_custom_emoji_id=B_PRICE_REG)
+    b.button(text="MAX • Нерег", callback_data="set_price_unregistered", icon_custom_emoji_id=B_PRICE_NEW)
+    b.button(text="MAX • Рег", callback_data="set_price_registered", icon_custom_emoji_id=B_PRICE_REG)
     b.button(text="Минимальная сумма вывода", callback_data="set_min_withdraw", icon_custom_emoji_id=B_MIN)
-    b.button(text="Назад", callback_data="admin_panel", icon_custom_emoji_id=B_BACK)
-    b.adjust(2, 1, 1)
-    return b.as_markup()
-
-
-def queue_menu_kb():
-    b = InlineKeyboardBuilder()
-    b.button(text="MAX • Незарегистрированный", callback_data="queue_unregistered", icon_custom_emoji_id=B_CAT_NEW)
-    b.button(text="MAX • Зарегистрированный", callback_data="queue_registered", icon_custom_emoji_id=B_CAT_REG)
-    b.button(text="Показать всю очередь", callback_data="queue_all", icon_custom_emoji_id=B_AQUEUE)
     b.button(text="Назад", callback_data="admin_panel", icon_custom_emoji_id=B_BACK)
     b.adjust(2, 1, 1)
     return b.as_markup()
@@ -148,22 +146,16 @@ def number_confirm_kb(number_id: int, user_id: int):
     return b.as_markup()
 
 
-def withdraw_confirm_user_kb():
-    b = InlineKeyboardBuilder()
-    b.button(text="Подтвердить вывод", callback_data="withdraw_user_yes", icon_custom_emoji_id=B_YES)
-    b.button(text="Назад", callback_data="withdraw_user_no", icon_custom_emoji_id=B_BACK)
-    b.adjust(1, 1)
-    return b.as_markup()
-
-
 def access_panel_kb():
     b = InlineKeyboardBuilder()
     b.button(text="Открыть доступ всем", callback_data="grant_all_access", icon_custom_emoji_id=B_GRANT_ALL)
     b.button(text="Закрыть доступ всем", callback_data="revoke_all_access", icon_custom_emoji_id=B_REVOKE_ALL)
     b.button(text="Пользователи без доступа", callback_data="list_no_access", icon_custom_emoji_id=B_NOACC)
     b.button(text="Пользователи с доступом", callback_data="list_with_access", icon_custom_emoji_id=B_YESACC)
+    b.button(text="Заблокировать пользователя", callback_data="ban_user_start", icon_custom_emoji_id=B_REJECT)
+    b.button(text="Разблокировать пользователя", callback_data="unban_user_start", icon_custom_emoji_id=B_ACCEPT)
     b.button(text="Назад", callback_data="admin_panel", icon_custom_emoji_id=B_BACK)
-    b.adjust(2, 2, 1)
+    b.adjust(2, 2, 2, 1)
     return b.as_markup()
 
 
